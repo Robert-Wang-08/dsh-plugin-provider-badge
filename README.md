@@ -66,3 +66,11 @@ node probe/smoke-client.mjs   # 交付形状 + 推导纯函数 + face 降级（�
 - 零 npm 依赖、零构建步骤；`require` 白名单仅 `react`。
 - 席位契约证据（宿主 0.1.5-rc.2）：`dsh-client-ui-conversation/lib/client.js`（渲染顺序）、`dsh-cordis-client-runner/lib/client.js`（registerOptions 与零占用）、`dsh-client-ui-model-selection/lib/client.js`（数据接入先例）。
 - 过程与 OpenSpec 文档（`openspec/`、`build_output_index.md`）保留在本地工作区，不入库（见 `.gitignore`）。
+
+## 宿主兼容性（2026-09-23 复查：dsh 0.1.5-rc.3 + dsh-permission-compat）
+
+宿主升级 `0.1.5-rc.2 → rc.3`（npm latest）并打上全局 `dsh-permission-compat` 沙箱补丁（改 `dsh-sandbox` + 三个工具守卫）后复查，**本插件零改动可用**：
+
+- 与补丁无关：源码与构建产物不引用 `sandbox_permissions` / `justification` / `approveEscalation` 等提权 API（grep 零命中）；宿主半只有一行日志。
+- 与 rc.3 无关：挂接插槽 `conversation.input.right` 在 rc.3 内核原样存在（`dsh-client-ui-conversation/lib/client.js`）；对 13 个宿主包做 rc.2↔rc.3 发布包逐文件 MD5 对比，仅 `dsh-client-ui-sidebar` 有一行版本号显示串差异，其余只有 package.json 版本号，插槽契约无变化。
+- 复查记录见 vault `70-WorkSpace/dsh工具维护日志.md` 2026-09-23 条目；复装说明见 `70-WorkSpace/dsh复装说明.md`。
