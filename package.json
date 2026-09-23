@@ -1,0 +1,37 @@
+{
+  "name": "dsh-plugin-provider-badge",
+  "description": "DSH Web 增强插件：在会话输入框下方模型及推理等级选择器正前方渲染 provider 徽标（显示名/路由名优选首字符+末字符两字母，黑体白字、对比色底，随会话选择即时跟随）。纯展示、零写入、不介入模型请求。",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek",
+    "deepseek-harness",
+    "dsh-plugin",
+    "provider-badge",
+    "web-ui"
+  ],
+  "license": "MIT"
+}

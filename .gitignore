@@ -1,0 +1,4 @@
+node_modules/
+openspec/
+build_output_index.md
+*.log

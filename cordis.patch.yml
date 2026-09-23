@@ -1,0 +1,10 @@
+# dsh-plugin-provider-badge bundle patch.
+# Applied when the plugin is installed via
+#   dsh plugin --profile <profile> add <path-to-this-package>
+# or listed in the profile's bundle layer.
+#
+# 本条目只登记 Host 载体行；全部 UI 能力由 package.json 的 dsh.client 声明
+# 驱动浏览器半（client.js 经 conversation.input.right 席位渲染徽标）。
+- insert:
+    - id: provider-badge
+      name: dsh-plugin-provider-badge
