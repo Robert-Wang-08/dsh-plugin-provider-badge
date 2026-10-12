@@ -62,8 +62,15 @@ for (const file of ['client.js', 'index.js']) {
 /* ── 载入模块（假 window.__ModuleLoader__ + 假 react） ──────────────── */
 
 let captured = null
+const fakeLS = {
+  store: {},
+  getItem(key) { return Object.prototype.hasOwnProperty.call(this.store, key) ? this.store[key] : null },
+  setItem(key, value) { this.store[key] = String(value) },
+  removeItem(key) { delete this.store[key] },
+}
 const sandbox = {
   window: { __ModuleLoader__: { load: (mod) => { captured = mod } } },
+  localStorage: fakeLS,
 }
 vm.createContext(sandbox)
 new vm.Script(source, { filename: 'client.js' }).runInContext(sandbox)
@@ -76,6 +83,11 @@ const fakeReact = {
   useMemo: (fn) => fn(),
   useEffect: hookIdentity,
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+  useState: (init) => {
+    const box = { value: typeof init === 'function' ? init() : init }
+    const setter = (next) => { box.value = typeof next === 'function' ? next(box.value) : next }
+    return [box.value, setter]
+  },
 }
 const exports_ = captured.factory((name) => {
   if (name !== 'react') throw new Error(`unexpected require: ${name}`)
@@ -85,7 +97,12 @@ const exports_ = captured.factory((name) => {
 check('exports.inject 权限清单正确', JSON.stringify(exports_.inject) === JSON.stringify(['slots', 'sessions', 'modelDirectories', 'remote', 'remote.session']))
 check('exports.__test 探针面就位', exports_.__test !== undefined && typeof exports_.apply === 'function')
 
-const { fourLetters, deriveLetters, colorOf, hash32, PALETTE, wheelDist, hueSlotsFor, routeIdsOf, badgeOf, faceOf, UNAVAILABLE } = exports_.__test
+const {
+  fourLetters, deriveLetters, colorOf, hash32, ROUTE_COLORS, ROUTE_LABELS, STORAGE_KEY, PALETTE,
+  parseColor, relativeLuminance, inkFor, wheelDist, hueSlotsFor, routeIdsOf,
+  resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
+  badgeOf, faceOf, UNAVAILABLE,
+} = exports_.__test
 
 /* ── S4 v2：文本推导（4 字母：多词首字母，不足补尾字母，无符号） ───── */
 /* 以下标识符均为泛化示例，不含任何真实路由名。 */
@@ -104,14 +121,27 @@ check('S4 deriveLetters 显示名缺失回退 id', deriveLetters(null, 'provider
 check('S4 deriveLetters 两者皆缺 → null', deriveLetters('', '---') === null)
 check('S4 确定性（重复推导同输出）', deriveLetters('Alpha One', 'x') === deriveLetters('Alpha One', 'x'))
 
-/* ── S5 v2：颜色推导（12 槽调色板 + 可见集合均匀铺槽） ─────────────── */
+/* ── S5 v2：颜色推导（路由色表优先 + 12 槽调色板均匀铺槽） ─────────── */
 
 check('S5 调色板 12 槽且格式合法', PALETTE.length === 12 && PALETTE.every((c) => /^hsl\(\d+, \d+%, \d+%\)$/.test(c)))
 check('S5 蓝段槽位 ≤ 2（218/248）', PALETTE.filter((c) => { const h = Number(c.match(/hsl\((\d+),/)[1]); return h >= 210 && h <= 255 }).length === 2)
 
+const EXPECTED_ROUTE_COLORS = {
+  'anthropic-relay': '#E0501E',
+  'codex-relay': '#2F6FEB',
+  'ais-2dsglm': '#8ECDF7',
+  'openai-codex': '#2E9E5B',
+  'kimi-coding': '#A7E0A9',
+  'opencode-go': '#7CB342',
+}
+for (const [id, hex] of Object.entries(EXPECTED_ROUTE_COLORS)) {
+  check(`S5 ROUTE_COLORS ${id} = ${hex}`, ROUTE_COLORS[id] === hex && colorOf(id, { groups: [], current: { provider: id } }) === hex)
+}
+
 const KNOWN_ROUTES = ['provider-alpha', 'provider-beta', 'provider-gamma-one', 'provider-gamma-two', 'provider-delta', 'provider-echo']
 const slotMap = hueSlotsFor(KNOWN_ROUTES)
 const slots6 = KNOWN_ROUTES.map((r) => slotMap.get(r))
+const unmappedState = { groups: KNOWN_ROUTES.map((id) => ({ id })), current: { provider: 'provider-alpha' } }
 check('S5 已知 6 路由槽位互不相同', new Set(slots6).size === KNOWN_ROUTES.length, JSON.stringify(KNOWN_ROUTES.map((r, i) => `${r}:${slots6[i]}`)))
 check('S5 两两轮盘距离 ≥ 2 槽（60°）', (() => {
   for (let i = 0; i < slots6.length; i++) for (let j = i + 1; j < slots6.length; j++) if (wheelDist(slots6[i], slots6[j]) < 2) return false
@@ -120,12 +150,41 @@ check('S5 两两轮盘距离 ≥ 2 槽（60°）', (() => {
 check('S5 同前缀对 provider-gamma-one/provider-gamma-two 距离 ≥ 2 槽', wheelDist(slotMap.get('provider-gamma-one'), slotMap.get('provider-gamma-two')) >= 2)
 check('S5 蓝段占用的路由 ≤ 2', slots6.filter((s) => s >= 6 && s <= 8).length <= 2, JSON.stringify(slots6))
 check('S5 分配确定性', JSON.stringify([...hueSlotsFor(KNOWN_ROUTES)]) === JSON.stringify([...slotMap]))
-check('S5 colorOf 落在调色板内且稳定', PALETTE.includes(colorOf('provider-alpha', { groups: KNOWN_ROUTES.map((id) => ({ id })), current: { provider: 'provider-alpha' } })))
+check('S5 colorOf 落在调色板内且稳定', PALETTE.includes(colorOf('provider-alpha', unmappedState)))
+check('S5 未入表路由仍走自动调色板', colorOf('provider-alpha', unmappedState) === PALETTE[slotMap.get('provider-alpha')])
 check('S5 routeIdsOf 提取 groups+current 并去重', (() => {
   const ids = routeIdsOf({ groups: [{ id: 'b' }, { id: 'a' }], current: { provider: 'a' } })
   return JSON.stringify(ids) === JSON.stringify(['b', 'a'])
 })())
 check('S5 空集合安全', hueSlotsFor([]).size === 0 && hueSlotsFor(['x', 42]).size === 1)
+
+/* ── S5b：字色对比度（parseColor / inkFor） ─────────────────────────── */
+
+check('S5b parseColor #rrggbb', (() => {
+  const c = parseColor('#2F6FEB')
+  return c !== null && Math.abs(c.r - 47 / 255) < 1e-9 && Math.abs(c.g - 111 / 255) < 1e-9 && Math.abs(c.b - 235 / 255) < 1e-9
+})())
+check('S5b parseColor #rgb', (() => {
+  const c = parseColor('#abc')
+  return c !== null && Math.abs(c.r - 170 / 255) < 1e-9 && Math.abs(c.g - 187 / 255) < 1e-9 && Math.abs(c.b - 204 / 255) < 1e-9
+})())
+check('S5b parseColor hsl()', (() => {
+  const c = parseColor('hsl(0, 62%, 46%)')
+  return c !== null && typeof c.r === 'number' && typeof c.g === 'number' && typeof c.b === 'number'
+    && c.r >= 0 && c.r <= 1 && c.g >= 0 && c.g <= 1 && c.b >= 0 && c.b <= 1
+})())
+check('S5b parseColor 非法 → null', parseColor('not-a-color') === null && parseColor(null) === null)
+check('S5b inkFor 浅蓝 #8ECDF7 → 深墨', inkFor('#8ECDF7') === '#14212B')
+check('S5b inkFor 浅绿 #A7E0A9 → 深墨', inkFor('#A7E0A9') === '#14212B')
+check('S5b inkFor 蓝 #2F6FEB → 白', inkFor('#2F6FEB') === '#fff')
+check('S5b inkFor 橘红 #E0501E 白字优先 → 白', inkFor('#E0501E') === '#fff')
+check('S5b inkFor 绿 #2E9E5B 白字优先 → 白', inkFor('#2E9E5B') === '#fff')
+check('S5b inkFor 草绿 #7CB342 白字对比度不足 → 深墨', inkFor('#7CB342') === '#14212B')
+check('S5b inkFor 无法解析 → 白', inkFor('not-a-color') === '#fff')
+check('S5b inkFor 调色板 hsl 条目可解析并出字色', (() => {
+  const ink = inkFor(PALETTE[0])
+  return (ink === '#fff' || ink === '#14212B') && typeof relativeLuminance === 'function'
+})())
 
 /* ── badgeOf：目录快照 → 徽标描述 ──────────────────────────────────── */
 
@@ -247,16 +306,112 @@ const renderState = {
 const renderStore = { subscribe: () => () => {}, getSnapshot: () => renderState }
 const rendered = registration.component({ store: renderStore, load: () => {} })
 const childText = Array.isArray(rendered?.props?.children) ? rendered.props.children.join('') : rendered?.props?.children
-check('渲染：徽标 span + 4 字母文本 + title + 调色板底色',
+check('渲染：徽标 span + 4 字母文本 + title + 调色板底色 + 对比字色',
   rendered !== null && rendered.type === 'span'
   && childText === 'AOne'
   && rendered.props.title === 'Alpha One (provider-alpha)'
   && rendered.props.style.background === colorOf('provider-alpha', renderState)
   && PALETTE.includes(rendered.props.style.background)
+  && rendered.props.style.color === inkFor(rendered.props.style.background)
   && rendered.props.style.fontWeight === 700
   && rendered.props.style.height === '16px')
 check('渲染：数据缺失 → null', registration.component(UNAVAILABLE) === null)
 check('渲染：store 快照为空 → null', registration.component({ store: { subscribe: () => () => {}, getSnapshot: () => ({ current: null }) } }) === null)
+
+/* ── S5c：选色优先级与持久化（resolveColor / localStorage） ─────────── */
+
+const autoState = { groups: [{ id: 'provider-alpha' }, { id: 'anthropic-relay' }], current: { provider: 'provider-alpha' } }
+check('S5c 优先级：用户覆盖 > 默认表', resolveColor('anthropic-relay', autoState, { 'anthropic-relay': '#123456' }) === '#123456')
+check('S5c 优先级：无覆盖 → 默认表', resolveColor('anthropic-relay', autoState, {}) === ROUTE_COLORS['anthropic-relay'])
+check('S5c 优先级：无覆盖且不在表 → 自动调色板', resolveColor('provider-alpha', autoState, {}) === colorOf('provider-alpha', autoState))
+check('S5c 覆盖值为非法色 → 忽略走表/自动', resolveColor('anthropic-relay', autoState, { 'anthropic-relay': 'not-a-color' }) === ROUTE_COLORS['anthropic-relay'])
+check('S5c 覆盖映射为空 → 忽略', resolveColor('anthropic-relay', autoState, null) === ROUTE_COLORS['anthropic-relay'])
+
+check('S5c loadOverrides 空存储 → {}', JSON.stringify(loadOverrides()) === '{}')
+fakeLS.store[STORAGE_KEY] = '{broken json'
+check('S5c loadOverrides 损坏 JSON → {}', JSON.stringify(loadOverrides()) === '{}')
+fakeLS.store[STORAGE_KEY] = JSON.stringify({ 'route-a': '#112233', 'route-b': 'bogus', 'route-c': 42 })
+check('S5c loadOverrides 剔除非法条目', JSON.stringify(loadOverrides()) === JSON.stringify({ 'route-a': '#112233' }))
+delete fakeLS.store[STORAGE_KEY]
+check('S5c saveOverrides 写回可读', (() => {
+  saveOverrides({ 'route-x': '#abcdef' })
+  const ok = fakeLS.store[STORAGE_KEY] === JSON.stringify({ 'route-x': '#abcdef' })
+  delete fakeLS.store[STORAGE_KEY]
+  return ok
+})())
+
+const swatches = swatchColors()
+check('S5c swatchColors 非空且全部可解析', Array.isArray(swatches) && swatches.length > 0 && swatches.every((c) => parseColor(c) !== null))
+check('S5c swatchColors 含六个默认路由色', Object.values(ROUTE_COLORS).every((c) => swatches.includes(c)))
+check('S5c swatchColors 去重', new Set(swatches).size === swatches.length)
+
+check('渲染：点击处理器与 root 标记就位', rendered !== null && typeof rendered.props.onClick === 'function' && rendered.props['data-provider-badge-root'] === true)
+check('渲染：点击在无 DOM 环境不抛（面板保持关闭）', (() => {
+  try { rendered.props.onClick({ stopPropagation() {}, currentTarget: null }); return true }
+  catch (e) { console.error(e); return false }
+})())
+fakeLS.store[STORAGE_KEY] = JSON.stringify({ 'provider-alpha': '#123456' })
+const renderedCovered = registration.component({ store: renderStore, load: () => {} })
+const coveredChild = Array.isArray(renderedCovered?.props?.children) ? renderedCovered.props.children.join('') : renderedCovered?.props?.children
+check('渲染：localStorage 覆盖色优先于调色板',
+  renderedCovered !== null && renderedCovered.type === 'span'
+  && coveredChild === 'AOne'
+  && renderedCovered.props.style.background === '#123456'
+  && renderedCovered.props.style.color === inkFor('#123456'))
+delete fakeLS.store[STORAGE_KEY]
+
+/* ── S5d：选色面板自适应定位（panelPositionFor） ─────────────────── */
+
+check('S5d 下方空间充足 → 按钮下方', (() => {
+  const pos = panelPositionFor({ left: 100, top: 300, bottom: 316 }, { width: 800, height: 600 })
+  return pos.top === 322 && pos.left === 100
+})())
+check('S5d 下方不足 → 翻到按钮上方', (() => {
+  const pos = panelPositionFor({ left: 100, top: 560, bottom: 576 }, { width: 800, height: 600 })
+  return pos.top === 560 - 6 - 116
+})())
+check('S5d 上方也不足 → 夹取在视口内', (() => {
+  const pos = panelPositionFor({ left: 100, top: 40, bottom: 56 }, { width: 800, height: 140 })
+  return pos.top >= 8 && pos.top + 116 <= 140 - 8 + 8 // top ∈ [8, 140-116-8] 取 max(8, h-116-8)
+})())
+check('S5d 右边界溢出 → 左移夹取', (() => {
+  const pos = panelPositionFor({ left: 740, top: 100, bottom: 116 }, { width: 800, height: 600 })
+  return pos.left === 800 - 176 - 8
+})())
+check('S5d 左边界溢出 → 留边距', (() => {
+  const pos = panelPositionFor({ left: -20, top: 100, bottom: 116 }, { width: 800, height: 600 })
+  return pos.left === 8
+})())
+check('S5d 无视口信息 → 兜底不抛', (() => {
+  const pos = panelPositionFor({ left: 50, top: 60, bottom: 76 }, undefined)
+  return pos.top === 82 && pos.left === 50
+})())
+check('S5d 锚点为空 → (0,0) 不抛', (() => {
+  const pos = panelPositionFor(null, { width: 800, height: 600 })
+  return typeof pos.left === 'number' && typeof pos.top === 'number'
+})())
+
+/* ── S5e：徽标缩写覆盖表（ROUTE_LABELS） ─────────────────────────── */
+
+const labelState = (routeId, name) => ({
+  current: { provider: routeId },
+  groups: [{ id: routeId, name }],
+})
+check('S5e deepseek-official → ds官', badgeOf(labelState('deepseek-official', 'DeepSeek Official')).text === 'ds官')
+check('S5e codex-relay → a1gpt', badgeOf(labelState('codex-relay', 'Codex Relay')).text === 'a1gpt')
+check('S5e openai-codex → gpt官', badgeOf(labelState('openai-codex', 'OpenAI Codex (official)')).text === 'gpt官')
+check('S5e anthropic-relay → claude', badgeOf(labelState('anthropic-relay', 'Anthropic Relay')).text === 'claude')
+check('S5e opencode-go → opengo（允许超 4 字符）', badgeOf(labelState('opencode-go', 'OpenCode Go')).text === 'opengo')
+check('S5e kimi-coding → kimi官', badgeOf(labelState('kimi-coding', 'Kimi Coding')).text === 'kimi官')
+check('S5e 未入表 ais-2dsglm 仍自动推导', (() => {
+  const badge = badgeOf(labelState('ais-2dsglm', 'AIS 2DSGLM'))
+  return badge !== null && badge.text === deriveLetters('AIS 2DSGLM', 'ais-2dsglm')
+})())
+check('S5e 未入表未知路由仍自动推导', (() => {
+  const badge = badgeOf(labelState('provider-alpha', 'Alpha One'))
+  return badge !== null && badge.text === 'AOne'
+})())
+check('S5e 覆盖不改变悬停 title', badgeOf(labelState('codex-relay', 'Codex Relay')).title === 'Codex Relay (codex-relay)')
 
 /* ── 汇总 ─────────────────────────────────────────────────────────── */
 

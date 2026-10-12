@@ -5,7 +5,7 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 ```
 [AGLM] my-model ▾   ···   [发送]
   ↑
-  provider 徽标（4 字母，黑体白字、高区分度调色板底色）
+  provider 徽标（4 字母，黑体；白字优先浅底改深墨；点徽标可选色）
 ```
 
 ## 行为
@@ -13,8 +13,9 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 | 维度 | 语义 |
 | --- | --- |
 | 位置 | `conversation.input.right` 席位（官方零占用的 list 席位），渲染在模型席位正前方，间距走 `.trailing` 既有 `gap:12px` |
-| 文本 | 4 字母：优选 Host 目录 `groups[].name`（provider 显示名），按非字母数字 + 汉字/拉丁交界切词后取各词首字母，不足补尾字母（如 `Alpha One`→`AOne`、`providerlongname`→`prov`、`智谱GLM`→`智GLM`）；显示名缺失回退路由 id 同规则（`provider-alpha`→`palp`）；仅字母数字，无符号/括号/减号 |
-| 颜色 | 12 槽调色板（刻意只留 2 个蓝段）+ 按可见 provider 集合均匀铺槽（排序第 i 落 `floor(i×12/n)`），集合内两两色距 ≥60°（n≤6），白字黑体；同集合内同路由恒同色，集合增减时重排 |
+| 文本 | 缩写覆盖表优先（`client.js` 顶部 `ROUTE_LABELS`）：`deepseek-official`→`ds官`、`codex-relay`→`a1gpt`、`openai-codex`→`gpt官`、`anthropic-relay`→`claude`、`opencode-go`→`opengo`、`kimi-coding`→`kimi官`（覆盖可超 4 字符）；未入表路由（含 `ais-2dsglm`）仍自动推导 4 字母：优选 Host 目录 `groups[].name`（provider 显示名），按非字母数字 + 汉字/拉丁交界切词后取各词首字母，不足补尾字母（如 `Alpha One`→`AOne`、`providerlongname`→`prov`、`智谱GLM`→`智GLM`）；显示名缺失回退路由 id 同规则（`provider-alpha`→`palp`）；仅字母数字，无符号/括号/减号；字色白字优先，白字对比度不足（<3）时改用深墨 `#14212B` |
+| 颜色 | 优先级：用户点选（localStorage）> `ROUTE_COLORS` 默认表 > 12 槽自动调色板；默认六色：`anthropic-relay`→`#E0501E`（橙红）、`codex-relay`→`#2F6FEB`（蓝）、`ais-2dsglm`→`#8ECDF7`（浅蓝）、`openai-codex`→`#2E9E5B`（绿）、`kimi-coding`→`#A7E0A9`（浅绿）、`opencode-go`→`#7CB342`（草绿）；未点选且未入表的仍走 12 槽自动调色板（刻意只留 2 个蓝段）+ 按可见 provider 集合均匀铺槽（排序第 i 落 `floor(i×12/n)`），集合内两两色距 ≥60°（n≤6）；改默认只改 `client.js` 顶部 `ROUTE_COLORS` |
+| 交互 | 点徽标弹出选色面板（六默认色 + 12 槽色块 + `恢复自动配色`），fixed 定位、点外部关闭；面板自适应位置：优先按钮下方，下方空间不足自动翻到上方，水平/垂直均夹取在视口内（`panelPositionFor`）；选色写入浏览器 localStorage（键 `dsh-plugin-provider-badge:colors`），重开/刷新后保持；`恢复自动配色` 清除该路由覆盖 |
 | 悬停 | title 显示 `显示名 (路由id)`（无显示名时仅路由 id） |
 | 跟随 | 数据来自官方共享目录 store（`ctx.modelDirectories`，与模型席位/`/model` 弹层同源），会话内切换模型/路由即时跟随 |
 | 降级 | subagent 转址会话、`modelDirectories` 未装载、目录解析抛错、无当前选择 → 渲染为空，不报错不占位 |
@@ -22,7 +23,7 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 ## 明确非目标
 
 - **不反映运行期故障转移重路由**：分档切换对 UI 透明是既有设计；徽标与官方模型席位同口径，反映**会话选择**的 provider。
-- 无点击交互、无菜单、不写 settings、不持凭据、不发起任何变更类请求。
+- 不写 settings、不持凭据、不发起任何变更类请求；唯一本地写入是 `localStorage` 选色（每路由可恢复自动配色）。
 - 不遮蔽任何官方席位；官方模型选择器行为零改变。
 
 ## 安装（挂载到 profile）
@@ -43,21 +44,23 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 
 ## 卸载
 
-从 profile `package.json` 移除依赖与 bundle 清单条目，重启 `dsh web` 即可；无任何持久化状态需要清理。
+从 profile `package.json` 移除依赖与 bundle 清单条目，重启 `dsh web` 即可；如需一并清理本地选色，在浏览器开发者工具 Application → Local Storage 删除键 `dsh-plugin-provider-badge:colors`。
 
 ## 验证
 
 ```powershell
-node probe/smoke-client.mjs   # 交付形状 + 推导纯函数 + face 降级（期望 ALL PASSED，62 项）
+node probe/smoke-client.mjs   # 交付形状 + 推导纯函数 + face 降级（期望 ALL PASSED）
 ```
 
 真机清单（重启 + 硬刷新后）：
 
 1. 模型席位左侧出现 4 字母徽标，路由不同颜色不同且区分度大；
-2. 悬停 title 显示 `显示名 (路由id)`；
-3. 会话内切换模型/路由，徽标即时跟随；
-4. subagent 会话无徽标；空白会话（hero 态）无徽标；
-5. 手动触发一次故障转移后徽标仍显示会话选择的路由（非目标确认）。
+2. 确认六条路由色表底色：`anthropic-relay` 橙红、`codex-relay` 蓝、`ais-2dsglm` 浅蓝、`openai-codex` 绿、`kimi-coding` 浅绿、`opencode-go` 草绿；浅色底上字色为深墨、深色底上为白；
+3. 点击徽标弹出选色面板：选色即时生效；刷新页面后颜色保持；点 `恢复自动配色` 回默认表/自动调色板；
+4. 悬停 title 显示 `显示名 (路由id)`；
+5. 会话内切换模型/路由，徽标即时跟随；
+6. subagent 会话无徽标；空白会话（hero 态）无徽标；
+7. 手动触发一次故障转移后徽标仍显示会话选择的路由（非目标确认）。
 
 ## 实现备注
 
