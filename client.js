@@ -7,8 +7,9 @@
  *
  *   [AGLM] my-model ▾   ···   [发送]
  *    ↑
- *    provider 徽标（4 字母：多词取各词首字母，不足补尾字母；黑体 + 按底色
- *    对比度选字色；有表路由用固定色，其余走可见集合均匀铺槽调色板）
+ *    └ provider 徽标（4 字母：多词取各词首字母，不足补尾字母；黑体 +
+ *      按底色对比度选字色；有表路由用固定色，其余走可见集合均匀铺槽调色板）。
+ *      选色入口移到级联面板一级底部「徽标颜色…」动作，徽标本身只开级联。
  *
  * - 文本：ROUTE_LABELS 缩写表精确命中优先（可超 4 字符）；未入表路由按
  *   provider 显示名（Host 目录 groups[].name）优选推导，缺失回退路由 id
@@ -19,14 +20,19 @@
  * - 数据：官方共享目录 store（ctx.modelDirectories），useSyncExternalStore
  *   订阅，会话切换模型/路由即时跟随；仅 status==="idle" 时触发一次官方
  *   load()（官方自带去重）。
+ * - 级联：点徽标（或 Enter/Space/方向键）打开两级向右级联菜单：一级只列
+ *   provider（成功行 + 失败 disabled 行），悬停/首字母选中 provider 后右侧
+ *   二级列该 provider 的模型（模型列**始终在右侧**，右侧空间不足整体左移并
+ *   收窄，不翻左）。选择复用同一 ModelDirectory.select（官方同口径
+ *   selectionOf），失败保持菜单并显示 localError。官方 /model 弹窗与
+ *   composer 模型席位零改变。
  * - 降级：modelDirectories 未装载 / directoryFor 抛错 / subagent 转址会话 /
  *   无当前选择 → 渲染 null，不报错不占位。
- * - 交互：点徽标弹出选色面板（当前路由六默认色 + 12 槽调色板，fixed 定位，
- *   点外部关闭）；选色优先级 用户覆盖 > ROUTE_COLORS 表 > 自动调色板。
  *
- * 唯一写入：点徽标选色写浏览器 localStorage（key 见 STORAGE_KEY，按路由 id，
- * 可恢复为自动配色）；不写 settings、不持凭据、不发变更请求；不反映运行期
- * 故障转移重路由（与官方模型席位同口径，反映会话选择）。
+ * 唯一写入：点 swatch 选色写浏览器 localStorage（key 见 STORAGE_KEY，按路由
+ * id，可恢复为自动配色）；不写 settings、不持凭据、不发起任何变更类请求；
+ * 模型切换仅经官方共享目录 select。不反映运行期故障转移重路由（与官方模型
+ * 席位同口径，反映会话选择）。
  *
  * 交付形状是硬契约：dsh 把每个插件的 client.js 当 classic script 拼进单个
  * /plugins 响应执行 —— 本文件必须保持 CJS + window.__ModuleLoader__.load
@@ -44,6 +50,7 @@ window.__ModuleLoader__.load({
     const useMemo = react.useMemo;
     const useEffect = react.useEffect;
     const useState = react.useState;
+    const useRef = react.useRef;
 
     /* ── 纯函数：文本与颜色推导（S4/S5 v2，probe 直接断言） ───────────── */
 
@@ -351,6 +358,208 @@ window.__ModuleLoader__.load({
       return { left, top };
     }
 
+    /* ── 纯函数：级联模型选择（spec §3，probe 直接断言） ──────────────── */
+
+    /**
+     * 官方同口径 selection（复刻 dsh-client-ui-model-selection selectionOf）：
+     * 同一 provider/model 保留 current.reasoningEffort，否则用
+     * model.reasoning.defaultEffort；effort 为 undefined 时不带字段。
+     * @param group - ModelProviderGroup（至少 id）。
+     * @param model - 模型项（至少 id；可选 reasoning.defaultEffort）。
+     * @param current - 当前 ModelSelection（可空）。
+     * @returns ModelSelection。
+     */
+    function selectionFor(group, model, current) {
+      const provider = group !== null && typeof group === "object" ? group.id : undefined;
+      const modelId = model !== null && typeof model === "object" ? model.id : undefined;
+      const reasoning = model !== null && typeof model === "object"
+        && model.reasoning !== null && typeof model.reasoning === "object" ? model.reasoning : null;
+      const defaultEffort = reasoning !== null ? reasoning.defaultEffort : undefined;
+      const same = current !== null && typeof current === "object"
+        && current.provider === provider && current.model === modelId;
+      let effort;
+      if (same && current.reasoningEffort !== undefined && current.reasoningEffort !== null) {
+        effort = current.reasoningEffort;
+      } else {
+        effort = defaultEffort;
+      }
+      const selection = { provider, model: modelId };
+      if (effort !== undefined) selection.reasoningEffort = effort;
+      return selection;
+    }
+
+    /**
+     * 级联菜单定位（spec §3/§7）：providerWidth 176、modelWidth 236、gap 6、
+     * panelHeight 340、视口边距 8。
+     * 模型列**始终位于 provider 右侧**（列顺序不翻转）：水平按两列总宽定位，
+     * 右侧空间不足时整体容器左移；仍不足则按视口宽度收窄（provider 最窄约
+     * 132px、model 取剩余宽度并在 CSS 端 ellipsis），最终整体夹取在视口 8px
+     * 边距内。绝不返回左侧模型列（不翻左）。
+     * 垂直：优先锚点上方（composer 多在底部），上方不足才下方，最终 clamp。
+     * @param anchor - 徽标视口矩形（至少 left/top/bottom），缺失时安全回退 0。
+     * @param viewport - { width, height }，缺失/非法时按 0 处理。
+     * @returns { left, top, totalWidth, providerWidth, modelWidth }：整个级联
+     *   容器（两列并排）的 fixed 原点与各列宽度。
+     */
+    function cascadePositionFor(anchor, viewport, providerWidth, modelWidth, gap, panelHeight) {
+      const w1 = typeof providerWidth === "number" ? providerWidth : 176;
+      const w2 = typeof modelWidth === "number" ? modelWidth : 236;
+      const g = typeof gap === "number" ? gap : 6;
+      const ph = typeof panelHeight === "number" ? panelHeight : 340;
+      const margin = 8;
+      const leftAnchor = anchor !== null && typeof anchor === "object" && typeof anchor.left === "number"
+        ? anchor.left : 0;
+      const topAnchor = anchor !== null && typeof anchor === "object" && typeof anchor.top === "number"
+        ? anchor.top : 0;
+      const bottomAnchor = anchor !== null && typeof anchor === "object" && typeof anchor.bottom === "number"
+        ? anchor.bottom : topAnchor;
+      const width = viewport !== null && typeof viewport === "object" && typeof viewport.width === "number"
+        ? viewport.width : 0;
+      const height = viewport !== null && typeof viewport === "object" && typeof viewport.height === "number"
+        ? viewport.height : 0;
+
+      // 垂直：优先上方，其次下方，最后夹取。
+      const above = topAnchor - g - ph;
+      const below = bottomAnchor + g;
+      let top;
+      if (height > 0) {
+        if (above >= margin) top = above;
+        else if (below + ph <= height - margin) top = below;
+        else top = below;
+        top = Math.max(margin, Math.min(top, height - ph - margin));
+        if (height < ph + margin * 2) top = margin;
+      } else {
+        top = above;
+      }
+
+      // 水平：两列总宽。右侧不足整体左移；仍不足按视口收窄（模型列仍在右）。
+      let pw = w1;
+      let mw = w2;
+      if (width > 0 && pw + g + mw > width - margin * 2) {
+        const available = width - margin * 2;
+        pw = Math.max(0, Math.min(w1, Math.max(132, available - g - mw)));
+        mw = Math.max(0, Math.min(w2, available - g - pw));
+      }
+      const totalWidth = pw + g + mw;
+      let left;
+      if (width > 0) {
+        left = leftAnchor;
+        if (left + totalWidth > width - margin) left = width - margin - totalWidth;
+        left = Math.max(margin, Math.min(left, width - totalWidth - margin));
+      } else {
+        left = leftAnchor;
+      }
+      return { left, top, totalWidth, providerWidth: pw, modelWidth: mw };
+    }
+
+    /**
+     * 首字母（含任意前缀）选中 provider：大小写不敏感，优先 group.name，再
+     * group.id；从 fromIndex 之后循环查找，重复同字母按当前索引前进。
+     * @param rows - provider 行（至少 id；可选 name、disabled）。
+     * @param query - 输入缓冲（一个或多个字符）。
+     * @param fromIndex - 当前索引（-1 表示从表首开始）。
+     * @returns 命中的行索引；无命中返回 -1。
+     */
+    function providerIndexByPrefix(rows, query, fromIndex) {
+      const list = Array.isArray(rows) ? rows : [];
+      const n = list.length;
+      if (n === 0 || typeof query !== "string" || query.length === 0) return -1;
+      const q = query.toLowerCase();
+      const start = Number.isInteger(fromIndex) ? fromIndex : -1;
+      const enabled = (row) => row !== null && typeof row === "object" && row.disabled !== true;
+      const nameMatch = (row) => row !== null && typeof row === "object"
+        && typeof row.name === "string" && row.name.toLowerCase().startsWith(q);
+      const idMatch = (row) => row !== null && typeof row === "object"
+        && typeof row.id === "string" && row.id.toLowerCase().startsWith(q);
+      for (const pred of [nameMatch, idMatch]) {
+        for (let i = 1; i <= n; i++) {
+          const idx = ((start + i) % n + n) % n;
+          if (enabled(list[idx]) && pred(list[idx])) return idx;
+        }
+      }
+      return -1;
+    }
+
+    /**
+     * 下一个可选 provider 行：跳过空 models 行与 failure（disabled）行，循环。
+     * @param items - provider 行（每行 models 数组；disabled 标记失败行）。
+     * @param current - 当前索引。
+     * @param delta - +1 或 -1。
+     * @returns 下一个可选行索引；无可选返回 -1。
+     */
+    function nextEnabledIndex(items, current, delta) {
+      const list = Array.isArray(items) ? items : [];
+      const n = list.length;
+      if (n === 0) return -1;
+      const step = delta >= 0 ? 1 : -1;
+      const enabled = (row) => row !== null && typeof row === "object"
+        && row.disabled !== true && Array.isArray(row.models) && row.models.length > 0;
+      let idx = Number.isInteger(current) && current >= 0 ? current : (step > 0 ? -1 : n);
+      for (let i = 0; i < n; i++) {
+        idx = ((idx + step) % n + n) % n;
+        if (enabled(list[idx])) return idx;
+      }
+      return -1;
+    }
+
+    /**
+     * 目录快照 → provider 行列表：成功 group（保持目录顺序）+ failures
+     * （disabled，仅展示不可选）。空 models 的 group 也 disabled（无法进入
+     * 二级）。
+     * @param state - 目录快照。
+     * @returns 行数组 { kind, id, name, models, disabled, failure }。
+     */
+    function providerRowsOf(state) {
+      const rows = [];
+      if (state !== null && typeof state === "object" && Array.isArray(state.groups)) {
+        for (const g of state.groups) {
+          if (g === null || typeof g !== "object") continue;
+          const models = Array.isArray(g.models) ? g.models : [];
+          const id = typeof g.id === "string" ? g.id : "";
+          rows.push({
+            kind: "group",
+            id,
+            name: typeof g.name === "string" && g.name.length > 0 ? g.name : id,
+            models,
+            disabled: models.length === 0,
+            failure: false,
+          });
+        }
+      }
+      if (state !== null && typeof state === "object" && Array.isArray(state.failures)) {
+        for (const f of state.failures) {
+          if (f === null || typeof f !== "object") continue;
+          const id = typeof f.id === "string" ? f.id : "";
+          rows.push({
+            kind: "failure",
+            id,
+            name: typeof f.name === "string" && f.name.length > 0 ? f.name : id,
+            message: typeof f.message === "string" ? f.message : "",
+            models: [],
+            disabled: true,
+            failure: true,
+          });
+        }
+      }
+      return rows;
+    }
+
+    /**
+     * scroll 事件是否应关闭弹层。
+     * scroll 不冒泡但会在捕获阶段自 window 下传，故弹层内部滚动列表时
+     * 事件目标命中弹层/徽标容器 → 不关闭；页面滚动等其余情况 → 关闭。
+     */
+    function shouldCloseOnScroll(target) {
+      if (target === null || target === undefined) return true;
+      if (typeof target.closest !== "function") return true;
+      try {
+        if (target.closest("[data-provider-badge-cascade], [data-provider-badge-root]") !== null) return false;
+      } catch (e) {
+        return true;
+      }
+      return true;
+    }
+
     /** 目录快照 → 徽标描述 { text, title, routeId }；数据不符返回 null。 */
     function badgeOf(state) {
       if (state === null || typeof state !== "object") return null;
@@ -378,6 +587,15 @@ window.__ModuleLoader__.load({
 
     const UNAVAILABLE = Object.freeze({});
 
+    /**
+     * 稳定返回 { store, load, select }：
+     * - store 为官方同一 ModelDirectory.store（useSyncExternalStore 订阅）。
+     * - load 仅在 status==="idle" 时触发官方 load()（自带去重，吞拒绝）。
+     * - select 代理到同一 directory.select（官方同口径），缺 select 或抛错时
+     *   返回可判定失败对象（result.ok===false，result.error.code/message），
+     *   由组件决定展示。subagent 转址会话 / 目录不可用 / 目录读取异常 →
+     *   UNAVAILABLE（无 store/load/select）。
+     */
     function faceOf(ctx, sessionId) {
       try {
         if (typeof sessionId !== "string" || sessionId.length === 0) return UNAVAILABLE;
@@ -395,6 +613,7 @@ window.__ModuleLoader__.load({
           || typeof store.subscribe !== "function" || typeof store.getSnapshot !== "function") {
           return UNAVAILABLE;
         }
+        const canSelect = typeof directory.select === "function";
         return {
           store,
           load: () => {
@@ -404,6 +623,23 @@ window.__ModuleLoader__.load({
                 directory.load().catch(() => {});
               }
             } catch (_) { /* 目录读取失败不打扰用户 */ }
+          },
+          select: (selection) => {
+            if (!canSelect) {
+              return Promise.resolve({ ok: false, error: { code: "select/unavailable", message: "模型切换不可用" } });
+            }
+            try {
+              return directory.select(selection);
+            } catch (err) {
+              return Promise.resolve({
+                ok: false,
+                error: {
+                  code: "select/throw",
+                  message: err !== null && typeof err === "object" && typeof err.message === "string"
+                    ? err.message : String(err),
+                },
+              });
+            }
           },
         };
       } catch (_) {
@@ -417,6 +653,13 @@ window.__ModuleLoader__.load({
     const snapshotNull = () => null;
     const serverSnapshotNull = () => null;
 
+    const CASCADE_PROVIDER_WIDTH = 176;
+    const CASCADE_MODEL_WIDTH = 236;
+    const CASCADE_GAP = 6;
+    const CASCADE_PANEL_HEIGHT = 340;
+    const MENU_BG = "var(--dsw-specific-menu, #20242b)";
+    const TYPEAHEAD_MS = 700;
+
     const BADGE_BASE_STYLE = {
       display: "inline-flex",
       alignItems: "center",
@@ -426,10 +669,59 @@ window.__ModuleLoader__.load({
       fontWeight: 700,
       fontSize: "10px",
       lineHeight: "16px",
-      letterSpacing: "0.02em",
+      letterSpacing: "0",
       userSelect: "none",
       flex: "none",
     };
+
+    const SPINNER_STYLE = {
+      width: "12px",
+      height: "12px",
+      borderRadius: "50%",
+      border: "2px solid rgba(255, 255, 255, 0.25)",
+      borderTopColor: "currentColor",
+      animation: "provider-badge-spin 0.7s linear infinite",
+      flex: "none",
+      marginLeft: "8px",
+      boxSizing: "border-box",
+    };
+
+    const SPIN_KEYFRAMES = h("style", { key: "__provider_badge_spin" },
+      "@keyframes provider-badge-spin{to{transform:rotate(360deg)}}");
+
+    const PANEL_BASE_STYLE = {
+      maxHeight: CASCADE_PANEL_HEIGHT + "px",
+      overflowY: "auto",
+      overscrollBehavior: "contain",
+      padding: "4px",
+      borderRadius: "8px",
+      background: MENU_BG,
+      boxShadow: "0 8px 24px rgba(0, 0, 0, 0.35)",
+      display: "flex",
+      flexDirection: "column",
+      letterSpacing: "0",
+      boxSizing: "border-box",
+    };
+
+    /** 二级模型首字母选中（name 优先，再 id；大小写不敏感，循环）。 */
+    function modelIndexByPrefix(models, query, fromIndex) {
+      const list = Array.isArray(models) ? models : [];
+      const n = list.length;
+      if (n === 0 || typeof query !== "string" || query.length === 0) return -1;
+      const q = query.toLowerCase();
+      const start = Number.isInteger(fromIndex) ? fromIndex : -1;
+      const nameMatch = (m) => m !== null && typeof m === "object"
+        && typeof m.name === "string" && m.name.toLowerCase().startsWith(q);
+      const idMatch = (m) => m !== null && typeof m === "object"
+        && typeof m.id === "string" && m.id.toLowerCase().startsWith(q);
+      for (const pred of [nameMatch, idMatch]) {
+        for (let i = 1; i <= n; i++) {
+          const idx = ((start + i) % n + n) % n;
+          if (pred(list[idx])) return idx;
+        }
+      }
+      return -1;
+    }
 
     function ProviderBadge(props) {
       const face = props !== null && typeof props === "object" ? props : UNAVAILABLE;
@@ -443,44 +735,129 @@ window.__ModuleLoader__.load({
         [store],
       );
       const state = useSyncExternalStore(subscribe, getSnapshot, serverSnapshotNull);
-      // 用户选色覆盖通过 lazy 初值只读取一次 localStorage；面板开启状态无持久化。
+
+      // 用户选色覆盖通过 lazy 初值只读取一次 localStorage。
       const [overrides, setOverrides] = useState(loadOverrides);
-      const [panel, setPanel] = useState(null);
+      // 一级 panel 是否切到色板视图（原选色面板逻辑并入级联一级底部）。
+      const [colorMode, setColorMode] = useState(false);
+      // 级联模型选择状态。
+      const [cascade, setCascade] = useState(null);
+      const [activeProviderId, setActiveProviderId] = useState(null);
+      const [focusLevel, setFocusLevel] = useState("providers");
+      const [providerIndex, setProviderIndex] = useState(0);
+      const [modelIndex, setModelIndex] = useState(0);
+      const [localError, setLocalError] = useState(null);
+      const [pendingSelection, setPendingSelection] = useState(null);
+      const keyBufferRef = useRef({ text: "", at: 0 });
+      const badgeRef = useRef(null);
 
       useEffect(() => {
         if (typeof face.load === "function") face.load();
       }, [face.load]);
 
-      // 点面板或徽标以外的位置关闭面板；徽标自身的开合交给 onClick toggle。
+      const closeAll = () => {
+        setCascade(null);
+        setColorMode(false);
+        setLocalError(null);
+        setActiveProviderId(null);
+        setFocusLevel("providers");
+      };
+
+      // 点 root（徽标/级联容器）以外的位置关闭所有弹层。
       useEffect(() => {
         if (typeof document === "undefined") return;
         const closeOnOutside = (event) => {
           if (event !== null && typeof event === "object"
             && event.target !== null && typeof event.target.closest === "function"
-            && event.target.closest("[data-provider-badge-picker], [data-provider-badge-root]") !== null) return;
-          setPanel(null);
+            && event.target.closest("[data-provider-badge-cascade], [data-provider-badge-root]") !== null) return;
+          closeAll();
         };
         document.addEventListener("mousedown", closeOnOutside);
         return () => document.removeEventListener("mousedown", closeOnOutside);
       }, []);
 
-      const badge = badgeOf(state);
-      if (badge === null) return null;
-      const background = resolveColor(badge.routeId, state, overrides);
-      const style = {
-        ...BADGE_BASE_STYLE,
-        background,
-        color: inkFor(background),
-        cursor: "pointer",
-        position: "relative",
+      // resize/scroll 关闭弹层，避免 fixed 锚点漂移（README 说明）。
+      useEffect(() => {
+        if (typeof window === "undefined") return;
+        const closeOnMove = () => { closeAll(); };
+        const closeOnScroll = (event) => {
+          const target = event !== null && typeof event === "object" ? event.target : null;
+          if (shouldCloseOnScroll(target)) closeAll();
+        };
+        window.addEventListener("resize", closeOnMove);
+        window.addEventListener("scroll", closeOnScroll, true);
+        return () => {
+          window.removeEventListener("resize", closeOnMove);
+          window.removeEventListener("scroll", closeOnScroll, true);
+        };
+      }, []);
+
+      const rows = providerRowsOf(state);
+      const currentProviderId = state !== null && typeof state === "object"
+        && state.current !== null && typeof state.current === "object"
+        && typeof state.current.provider === "string" ? state.current.provider : null;
+      const currentModelId = state !== null && typeof state === "object"
+        && state.current !== null && typeof state.current === "object"
+        && typeof state.current.model === "string" ? state.current.model : null;
+      const activeRow = activeProviderId !== null ? rows.find((r) => r.id === activeProviderId) : undefined;
+      const activeModels = activeRow !== undefined && Array.isArray(activeRow.models) ? activeRow.models : [];
+      const directoryPending = state !== null && typeof state === "object"
+        && state.pending !== null && typeof state.pending === "object" ? state.pending : null;
+      const effectivePending = directoryPending !== null ? directoryPending : pendingSelection;
+      const selecting = pendingSelection !== null
+        || (state !== null && typeof state === "object" && state.status === "selecting");
+
+      const typeAhead = (key) => {
+        const now = Date.now();
+        const buf = keyBufferRef.current;
+        if (buf === null || buf === undefined || now - buf.at > TYPEAHEAD_MS) keyBufferRef.current = { text: key, at: now };
+        else keyBufferRef.current = { text: buf.text + key, at: now };
+        return keyBufferRef.current.text;
       };
 
-      const openPanel = (event) => {
+      const focusProviderAt = (idx) => {
+        if (idx < 0 || idx >= rows.length) return;
+        setProviderIndex(idx);
+        setActiveProviderId(rows[idx].id);
+        setModelIndex(0);
+      };
+
+      const moveProvider = (delta) => {
+        const idx = nextEnabledIndex(rows, providerIndex, delta);
+        if (idx >= 0) focusProviderAt(idx);
+      };
+
+      const moveProviderEdge = (which) => {
+        const idx = which === "first" ? nextEnabledIndex(rows, -1, 1) : nextEnabledIndex(rows, -1, -1);
+        if (idx >= 0) focusProviderAt(idx);
+      };
+
+      const enterModels = () => {
+        if (activeRow !== undefined && activeModels.length > 0) {
+          setFocusLevel("models");
+          setModelIndex(0);
+        }
+      };
+
+      const closeCascade = () => {
+        setCascade(null);
+        setLocalError(null);
+        setActiveProviderId(null);
+        setFocusLevel("providers");
+      };
+
+      const openCascade = (event) => {
         if (event !== null && typeof event === "object" && typeof event.stopPropagation === "function") {
           event.stopPropagation();
         }
-        if (panel !== null) { setPanel(null); return; }
-        let position = { left: 0, top: 0 };
+        if (cascade !== null) { closeCascade(); return; }
+        let position = {
+          left: 0,
+          top: 0,
+          totalWidth: CASCADE_PROVIDER_WIDTH + CASCADE_GAP + CASCADE_MODEL_WIDTH,
+          providerWidth: CASCADE_PROVIDER_WIDTH,
+          modelWidth: CASCADE_MODEL_WIDTH,
+        };
         try {
           const rect = event !== null && typeof event === "object" && event.currentTarget !== null
             ? event.currentTarget.getBoundingClientRect()
@@ -488,10 +865,150 @@ window.__ModuleLoader__.load({
           const viewport = typeof window !== "undefined"
             ? { width: window.innerWidth, height: window.innerHeight }
             : undefined;
-          position = panelPositionFor(rect, viewport);
-        } catch (_) { /* 无 DOM 环境不做定位；面板落在 (0,0) 不影响逻辑 */ }
-        setPanel(position);
+          position = cascadePositionFor(rect, viewport,
+            CASCADE_PROVIDER_WIDTH, CASCADE_MODEL_WIDTH, CASCADE_GAP, CASCADE_PANEL_HEIGHT);
+        } catch (_) { /* 无 DOM 环境不做定位；菜单落在 (0,0) 不影响逻辑 */ }
+        let idx = rows.findIndex((r) => r.id === currentProviderId && !r.disabled);
+        if (idx < 0) idx = nextEnabledIndex(rows, -1, 1);
+        const row = idx >= 0 ? rows[idx] : undefined;
+        setCascade(position);
+        setColorMode(false);
+        setActiveProviderId(row !== undefined ? row.id : null);
+        setProviderIndex(idx >= 0 ? idx : 0);
+        setModelIndex(0);
+        setFocusLevel("providers");
+        setLocalError(null);
       };
+
+      const pickModel = (group, model) => {
+        if (selecting || group === undefined || model === undefined) return;
+        const selection = selectionFor(group, model, state !== null && typeof state === "object" ? state.current : null);
+        setLocalError(null);
+        setPendingSelection(selection);
+        const fail = (message) => { setPendingSelection(null); setLocalError(message); };
+        const stateError = state !== null && typeof state === "object" && typeof state.error === "string" && state.error.length > 0
+          ? state.error : null;
+        let promise;
+        try {
+          promise = typeof face.select === "function"
+            ? face.select(selection)
+            : Promise.resolve({ ok: false, error: { code: "select/unavailable", message: "模型切换不可用" } });
+        } catch (err) {
+          fail(err !== null && typeof err === "object" && typeof err.message === "string" ? err.message : "模型切换失败");
+          return;
+        }
+        Promise.resolve(promise).then((result) => {
+          const ok = result === undefined || result === null ? true : result.ok !== false;
+          if (!ok) {
+            const err = result !== null && typeof result === "object" ? result.error : null;
+            if (err !== null && typeof err === "object" && err.code === "session/writer-held") {
+              fail("会话正被其他 DSH 占用");
+              return;
+            }
+            const message = err !== null && typeof err === "object" && typeof err.message === "string" && err.message.length > 0
+              ? err.message : stateError;
+            fail(message !== null ? message : "模型切换失败");
+            return;
+          }
+          setPendingSelection(null);
+          closeCascade();
+          try {
+            if (badgeRef.current !== null && badgeRef.current !== undefined && typeof badgeRef.current.focus === "function") {
+              badgeRef.current.focus();
+            }
+          } catch (_) { /* 无 DOM 环境忽略聚焦 */ }
+        }).catch((err) => {
+          fail(err !== null && typeof err === "object" && typeof err.message === "string" ? err.message : "模型切换失败");
+        });
+      };
+
+      const onKeyDown = (event) => {
+        if (event === null || typeof event !== "object") return;
+        const key = event.key;
+        const consume = () => {
+          if (typeof event.preventDefault === "function") event.preventDefault();
+          if (typeof event.stopPropagation === "function") event.stopPropagation();
+        };
+        if (cascade === null) {
+          if (key === "Enter" || key === " " || key === "Spacebar" || key === "ArrowDown" || key === "ArrowUp") {
+            consume();
+            openCascade(event);
+          }
+          return;
+        }
+        if (key === "Escape") {
+          consume();
+          if (colorMode) setColorMode(false);
+          else if (focusLevel === "models") setFocusLevel("providers");
+          else closeCascade();
+          return;
+        }
+        if (key === "Tab") return;
+        if (colorMode) return;
+        const printable = typeof key === "string" && key.length === 1
+          && !event.ctrlKey && !event.metaKey && !event.altKey;
+        if (focusLevel === "providers") {
+          if (key === "ArrowDown") { consume(); moveProvider(1); }
+          else if (key === "ArrowUp") { consume(); moveProvider(-1); }
+          else if (key === "Home") { consume(); moveProviderEdge("first"); }
+          else if (key === "End") { consume(); moveProviderEdge("last"); }
+          else if (key === "ArrowRight" || key === "Enter") { consume(); enterModels(); }
+          else if (printable) {
+            consume();
+            const idx = providerIndexByPrefix(rows, typeAhead(key), providerIndex);
+            if (idx >= 0) focusProviderAt(idx);
+          }
+        } else {
+          if (activeModels.length === 0) { setFocusLevel("providers"); return; }
+          if (key === "ArrowDown") { consume(); setModelIndex((i) => (i + 1) % activeModels.length); }
+          else if (key === "ArrowUp") { consume(); setModelIndex((i) => (i - 1 + activeModels.length) % activeModels.length); }
+          else if (key === "Home") { consume(); setModelIndex(0); }
+          else if (key === "End") { consume(); setModelIndex(activeModels.length - 1); }
+          else if (key === "ArrowLeft") { consume(); setFocusLevel("providers"); }
+          else if (key === "Enter") {
+            consume();
+            const model = activeModels[modelIndex];
+            if (model !== undefined) pickModel(activeRow, model);
+          } else if (printable) {
+            consume();
+            const idx = modelIndexByPrefix(activeModels, typeAhead(key), modelIndex);
+            if (idx >= 0) setModelIndex(idx);
+          }
+        }
+      };
+
+      /** 一级面板切到色板视图（复用原有 localStorage 选色）。 */
+      const openColorPalette = (event) => {
+        if (event !== null && typeof event === "object" && typeof event.stopPropagation === "function") {
+          event.stopPropagation();
+        }
+        setColorMode(true);
+      };
+
+      const badge = badgeOf(state);
+      if (badge === null) return null;
+      const background = resolveColor(badge.routeId, state, overrides);
+
+      const badgeEl = h("span", {
+        key: "__badge",
+        ref: badgeRef,
+        role: "button",
+        tabIndex: 0,
+        title: badge.title,
+        "aria-label": badge.title,
+        "aria-haspopup": "listbox",
+        "aria-expanded": cascade !== null,
+        "data-provider-badge-root": true,
+        "data-provider-badge-badge": true,
+        style: {
+          ...BADGE_BASE_STYLE,
+          background,
+          color: inkFor(background),
+          cursor: "pointer",
+        },
+        onClick: openCascade,
+        onKeyDown,
+      }, badge.text);
 
       const pick = (color) => {
         const next = { ...overrides };
@@ -499,63 +1016,241 @@ window.__ModuleLoader__.load({
         else next[badge.routeId] = color;
         saveOverrides(next);
         setOverrides(next);
-        setPanel(null);
+        setColorMode(false);
       };
 
-      const panelEl = panel === null
-        ? undefined
-        : h("div",
-          {
-            "data-provider-badge-picker": true,
-            role: "listbox",
-            "aria-label": badge.title,
+      // 关闭态只渲染徽标本身（保持原有 span 形状与点击/键盘入口）。
+      if (cascade === null) return badgeEl;
+
+      const swatchDot = h("span", {
+        key: "__color_dot",
+        style: {
+          width: "12px",
+          height: "12px",
+          borderRadius: "50%",
+          border: "1px solid rgba(255, 255, 255, 0.35)",
+          background,
+          flex: "none",
+          boxSizing: "border-box",
+        },
+      }, null);
+
+      const stopIt = (event) => {
+        if (event !== null && typeof event === "object" && typeof event.stopPropagation === "function") {
+          event.stopPropagation();
+        }
+      };
+
+      let providerPanel;
+      if (colorMode) {
+        // 一级面板切到原有色板视图（复用 localStorage），可返回 provider 列表。
+        const backEl = h("button", {
+          type: "button",
+          key: "__color_back",
+          "data-provider-badge-color-back": true,
+          onClick: (event) => { stopIt(event); setColorMode(false); },
+          style: {
+            display: "flex",
+            alignItems: "center",
+            height: "30px",
+            padding: "0 8px",
+            border: "none",
+            background: "transparent",
+            color: "inherit",
+            font: "inherit",
+            fontSize: "12px",
+            letterSpacing: "0",
+            boxSizing: "border-box",
+            cursor: "pointer",
+            textAlign: "left",
+          },
+        }, "‹ 返回");
+        const gridEl = h("div",
+          { key: "__swatches", style: { display: "flex", gap: "6px", flexWrap: "wrap", maxWidth: "232px", padding: "4px 8px" } },
+          swatchColors().map((color) => h("button", {
+            type: "button",
+            key: color,
+            title: color,
+            "aria-label": color,
             style: {
-              position: "fixed",
-              zIndex: 1200,
-              minWidth: "160px",
-              padding: "8px",
-              borderRadius: "12px",
-              background: "var(--dsw-specific-menu, #20242b)",
-              boxShadow: "0 8px 24px rgba(0, 0, 0, 0.35)",
-              display: "flex",
-              flexDirection: "column",
-              gap: "6px",
-              left: panel.left,
-              top: panel.top,
+              width: "20px", height: "20px", padding: "0", borderRadius: "5px",
+              border: "1px solid rgba(255, 255, 255, 0.22)", background: color, cursor: "pointer",
+            },
+            onClick: (event) => { stopIt(event); pick(color); },
+          }, null)),
+        );
+        const autoEl = h("button", {
+          type: "button",
+          key: "__auto",
+          onClick: (event) => { stopIt(event); pick(null); },
+          style: {
+            alignSelf: "flex-start", padding: "2px 6px", border: "none", borderRadius: "6px",
+            background: "transparent", color: "inherit", font: "inherit", fontSize: "12px",
+            letterSpacing: "0", cursor: "pointer",
+          },
+        }, Object.prototype.hasOwnProperty.call(overrides, badge.routeId) ? "恢复自动配色" : "自动配色");
+        providerPanel = h("div",
+          { key: "__providers", role: "listbox", "aria-label": badge.title, style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px" } },
+          backEl, gridEl, autoEl,
+        );
+      } else {
+        const providerRowEls = rows.map((row, index) => {
+          const isActive = activeProviderId === row.id;
+          const isCurrent = currentProviderId === row.id;
+          const isPending = effectivePending !== null && effectivePending.provider === row.id;
+          const rowStyle = {
+            height: "30px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "0 8px",
+            borderRadius: "6px",
+            fontSize: "12px",
+            letterSpacing: "0",
+            boxSizing: "border-box",
+            cursor: row.disabled ? "default" : "pointer",
+            opacity: row.disabled ? 0.5 : 1,
+            background: isActive ? "rgba(255, 255, 255, 0.10)" : "transparent",
+            color: "inherit",
+          };
+          if (isCurrent) rowStyle.fontWeight = 700;
+          let trailing = row.failure ? "!" : ">";
+          if (isPending) trailing = "…";
+          return h("div", {
+            key: row.id + ":" + index,
+            role: "option",
+            "aria-selected": isActive,
+            "aria-disabled": row.disabled,
+            "data-provider-row": row.id,
+            style: rowStyle,
+            onMouseEnter: () => { if (!row.disabled) { setActiveProviderId(row.id); setProviderIndex(index); setModelIndex(0); } },
+            onClick: () => {
+              if (row.disabled) return;
+              setActiveProviderId(row.id);
+              setProviderIndex(index);
+              setModelIndex(0);
+              setFocusLevel("models");
             },
           },
-          h("div",
-            { style: { display: "flex", gap: "6px", flexWrap: "wrap", maxWidth: "232px" } },
-            swatchColors().map((color) => h("button", {
-              type: "button",
-              key: color,
-              title: color,
-              "aria-label": color,
-              style: {
-                width: "20px", height: "20px", padding: "0", borderRadius: "5px",
-                border: "1px solid rgba(255, 255, 255, 0.22)", background: color, cursor: "pointer",
-              },
-              onClick: () => pick(color),
-            }, null)),
-          ),
-          h("button", {
-            type: "button",
+          h("span", { key: "name", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, row.name),
+          h("span", { key: "sym", style: { marginLeft: "8px", opacity: 0.7, flex: "none" } }, trailing),
+          );
+        });
+        if (localError !== null) {
+          providerRowEls.push(h("div", {
+            key: "__error",
+            "data-provider-badge-error": true,
+            "aria-live": "polite",
             style: {
-              alignSelf: "flex-start", padding: "2px 4px", border: "none", borderRadius: "6px",
-              background: "transparent", color: "inherit", font: "inherit", fontSize: "12px",
-              cursor: "pointer",
+              padding: "6px 8px",
+              fontSize: "11px",
+              lineHeight: "1.4",
+              letterSpacing: "0",
+              color: "#ff9b9b",
+              borderTop: "1px solid rgba(255, 255, 255, 0.12)",
             },
-            onClick: () => pick(null),
-          }, Object.prototype.hasOwnProperty.call(overrides, badge.routeId) ? "恢复自动配色" : "自动配色"),
+          }, localError));
+        }
+        // 一级底部：选色入口（swatch + 「徽标颜色…」），点击切到色板视图。
+        providerRowEls.push(h("button", {
+          type: "button",
+          key: "__color_action",
+          "data-provider-badge-color-action": true,
+          title: "设置徽标颜色",
+          onClick: openColorPalette,
+          style: {
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            width: "100%",
+            height: "30px",
+            marginTop: "4px",
+            padding: "0 8px",
+            border: "none",
+            borderTop: "1px solid rgba(255, 255, 255, 0.12)",
+            background: "transparent",
+            color: "inherit",
+            font: "inherit",
+            fontSize: "12px",
+            letterSpacing: "0",
+            boxSizing: "border-box",
+            cursor: "pointer",
+            textAlign: "left",
+          },
+        },
+        swatchDot,
+        h("span", { key: "label", style: { flex: "1 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "徽标颜色…"),
+        ));
+        providerPanel = h("div",
+          { key: "__providers", role: "listbox", "aria-label": badge.title, style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px" } },
+          providerRowEls,
         );
+      }
 
-      const badgeEl = h("span", {
-        style,
-        title: badge.title,
-        "data-provider-badge-root": true,
-        onClick: openPanel,
-      }, badge.text);
-      return panelEl === undefined ? badgeEl : [badgeEl, panelEl];
+      const panels = [providerPanel];
+      if (!colorMode && activeRow !== undefined && activeModels.length > 0) {
+        const modelRowEls = activeModels.map((model, index) => {
+          const isCurrent = currentProviderId === activeRow.id && currentModelId === model.id;
+          const isActive = index === modelIndex;
+          const isPending = effectivePending !== null
+            && effectivePending.provider === activeRow.id && effectivePending.model === model.id;
+          const rowStyle = {
+            height: "30px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "0 8px",
+            borderRadius: "6px",
+            fontSize: "12px",
+            letterSpacing: "0",
+            boxSizing: "border-box",
+            cursor: "pointer",
+            background: isActive ? "rgba(255, 255, 255, 0.10)" : "transparent",
+            color: "inherit",
+          };
+          if (isCurrent) rowStyle.fontWeight = 700;
+          const trailing = isPending
+            ? h("span", { key: "spin", style: SPINNER_STYLE }, null)
+            : (isCurrent ? h("span", { key: "check", style: { marginLeft: "8px", opacity: 0.9, flex: "none" } }, "✓") : null);
+          return h("div", {
+            key: model.id + ":" + index,
+            role: "option",
+            "aria-selected": isActive,
+            "data-model-row": model.id,
+            style: rowStyle,
+            onMouseEnter: () => setModelIndex(index),
+            onClick: () => pickModel(activeRow, model),
+          },
+          h("span", { key: "name", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+            typeof model.name === "string" && model.name.length > 0 ? model.name : String(model.id)),
+          trailing,
+          );
+        });
+        panels.push(h("div",
+          { key: "__models", role: "listbox", "aria-label": activeRow.name, style: { ...PANEL_BASE_STYLE, width: cascade.modelWidth + "px" } },
+          modelRowEls,
+        ));
+      }
+
+      const cascadeEl = h("div", {
+        key: "__cascade",
+        "data-provider-badge-cascade": true,
+        role: "group",
+        "aria-label": badge.title,
+        onKeyDown,
+        style: {
+          position: "fixed",
+          left: cascade.left,
+          top: cascade.top,
+          zIndex: 1200,
+          display: "flex",
+          flexDirection: "row",
+          gap: CASCADE_GAP + "px",
+          letterSpacing: "0",
+        },
+      }, SPIN_KEYFRAMES, ...panels);
+
+      return [badgeEl, cascadeEl];
     }
 
     /* ── 注册 ─────────────────────────────────────────────────────── */
@@ -590,6 +1285,8 @@ window.__ModuleLoader__.load({
       parseColor, relativeLuminance, inkFor, wheelDist, hueSlotsFor, routeIdsOf,
       colorOf, resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
       badgeOf, faceOf, UNAVAILABLE,
+      selectionFor, cascadePositionFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
+      shouldCloseOnScroll,
     };
 
     exports.apply = apply;

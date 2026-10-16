@@ -82,6 +82,7 @@ const fakeReact = {
   createElement: (type, props, ...children) => ({ type, props: { ...props, children } }),
   useMemo: (fn) => fn(),
   useEffect: hookIdentity,
+  useRef: (init) => ({ current: init }),
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
   useState: (init) => {
     const box = { value: typeof init === 'function' ? init() : init }
@@ -102,6 +103,8 @@ const {
   parseColor, relativeLuminance, inkFor, wheelDist, hueSlotsFor, routeIdsOf,
   resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
   badgeOf, faceOf, UNAVAILABLE,
+  selectionFor, cascadePositionFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
+  shouldCloseOnScroll,
 } = exports_.__test
 
 /* ── S4 v2：文本推导（4 字母：多词首字母，不足补尾字母，无符号） ───── */
@@ -236,6 +239,7 @@ check('faceOf store 形状不符 → UNAVAILABLE', !('store' in faceOf(badStoreC
 /* 正常分支：store 透传 + idle 才 load + load 拒绝被吞 */
 let loadCalls = 0
 let loadShouldReject = false
+const selectCalls = []
 const storeState = { status: 'idle' }
 const fakeStore = {
   subscribe(fn) { return () => fn && fn() },
@@ -250,6 +254,10 @@ const normalCtxModelDirectories = {
         loadCalls += 1
         if (loadShouldReject) return Promise.reject(new Error('catalog down'))
         return Promise.resolve(storeState)
+      },
+      select(selection) {
+        selectCalls.push(selection)
+        return Promise.resolve({ ok: true })
       },
     }
   },
@@ -412,6 +420,149 @@ check('S5e 未入表未知路由仍自动推导', (() => {
   return badge !== null && badge.text === 'AOne'
 })())
 check('S5e 覆盖不改变悬停 title', badgeOf(labelState('codex-relay', 'Codex Relay')).title === 'Codex Relay (codex-relay)')
+
+/* ── S8：级联模型选择门禁（selectionFor / cascadePositionFor / ─────────── */
+/*        providerIndexByPrefix / providerRowsOf / faceOf.select）           */
+
+const groupX = { id: 'provider-alpha', name: 'Alpha One' }
+const modelX = { id: 'model-x', name: 'Model X', reasoning: { defaultEffort: 'high' } }
+const modelPlain = { id: 'model-plain', name: 'Plain' }
+
+check('S8 selectionFor 换模型用 defaultEffort', (() => {
+  const sel = selectionFor(groupX, modelX, { provider: 'provider-beta', model: 'model-y' })
+  return sel.provider === 'provider-alpha' && sel.model === 'model-x' && sel.reasoningEffort === 'high'
+})())
+check('S8 selectionFor 同模型保留 current.reasoningEffort', (() => {
+  const sel = selectionFor(groupX, modelX, { provider: 'provider-alpha', model: 'model-x', reasoningEffort: 'low' })
+  return sel.reasoningEffort === 'low'
+})())
+check('S8 selectionFor 同模型但 current 无 effort → defaultEffort', (() => {
+  const sel = selectionFor(groupX, modelX, { provider: 'provider-alpha', model: 'model-x' })
+  return sel.reasoningEffort === 'high'
+})())
+check('S8 selectionFor 无 reasoning 不带 effort 字段', (() => {
+  const sel = selectionFor(groupX, modelPlain, { provider: 'provider-alpha', model: 'model-x' })
+  return !('reasoningEffort' in sel) && sel.provider === 'provider-alpha' && sel.model === 'model-plain'
+})())
+
+const VP = { width: 800, height: 600 }
+check('S8 cascade 正常：定位在锚点、模型列始终在 provider 右侧', (() => {
+  const pos = cascadePositionFor({ left: 100, top: 300, bottom: 316 }, VP)
+  const providerRight = pos.left + pos.providerWidth
+  const modelLeft = providerRight + 6
+  return pos.left === 100
+    && pos.providerWidth === 176 && pos.modelWidth === 236
+    && pos.totalWidth === 176 + 6 + 236
+    && modelLeft > providerRight && modelLeft + pos.modelWidth <= 800 - 8
+})())
+check('S8 cascade 右侧不足 → 整体左移（不翻左、列序不变）', (() => {
+  const pos = cascadePositionFor({ left: 600, top: 300, bottom: 316 }, VP)
+  return pos.left === 800 - 8 - pos.totalWidth
+    && pos.providerWidth === 176 && pos.modelWidth === 236
+    && pos.left + pos.providerWidth + 6 + pos.modelWidth <= 800 - 8
+})())
+check('S8 cascade 极窄视口 → provider 收窄、模型取剩余且仍在右侧', (() => {
+  const pos = cascadePositionFor({ left: 0, top: 300, bottom: 316 }, { width: 260, height: 600 })
+  return pos.left === 8
+    && pos.providerWidth >= 132
+    && pos.modelWidth >= 0
+    && pos.totalWidth <= 260 - 8 - 8 + 1e-9
+    && pos.providerWidth + 6 + pos.modelWidth === pos.totalWidth
+})())
+check('S8 cascade 垂直：下方空间足 → 锚点下方', (() => {
+  return cascadePositionFor({ left: 100, top: 40, bottom: 56 }, VP).top === 62
+})())
+check('S8 cascade 垂直：下方不足 → 翻到锚点上方', (() => {
+  return cascadePositionFor({ left: 100, top: 560, bottom: 576 }, VP).top === 560 - 6 - 340
+})())
+check('S8 cascade 缺 rect → 安全回退不抛、列宽默认', (() => {
+  const pos = cascadePositionFor(null, VP)
+  return typeof pos.left === 'number' && typeof pos.top === 'number'
+    && typeof pos.totalWidth === 'number' && pos.providerWidth === 176 && pos.modelWidth === 236
+})())
+check('S8 cascade 无视口 → 不抛且列宽默认', (() => {
+  const pos = cascadePositionFor({ left: 10, top: 10, bottom: 26 }, undefined)
+  return pos.providerWidth === 176 && pos.modelWidth === 236 && pos.left === 10
+})())
+
+const pRows = [
+  { id: 'provider-alpha', name: 'Alpha One' },
+  { id: 'provider-beta', name: 'Beta Two' },
+  { id: 'provider-gamma', name: 'Gamma' },
+]
+check('S8 providerIndexByPrefix 按 name 首字母', providerIndexByPrefix(pRows, 'b', -1) === 1)
+check('S8 providerIndexByPrefix 大小写不敏感', providerIndexByPrefix(pRows, 'B', -1) === 1)
+check('S8 providerIndexByPrefix name 未命中回退 id', providerIndexByPrefix(pRows, 'g', -1) === 2)
+check('S8 providerIndexByPrefix 从当前索引循环', providerIndexByPrefix(pRows, 'a', 2) === 0)
+check('S8 providerIndexByPrefix 多匹配取循环内下一项', (() => {
+  const rows = [{ id: 'a1', name: 'Alpha' }, { id: 'a2', name: 'Alpha' }, { id: 'a3', name: 'Alpha' }]
+  return providerIndexByPrefix(rows, 'a', 0) === 1 && providerIndexByPrefix(rows, 'a', 2) === 0
+})())
+check('S8 providerIndexByPrefix 跳过 disabled 行', (() => {
+  const rows = [{ id: 'a1', name: 'Alpha', disabled: true }, { id: 'a2', name: 'Alpha' }]
+  return providerIndexByPrefix(rows, 'a', -1) === 1
+})())
+check('S8 providerIndexByPrefix 无匹配 → -1', providerIndexByPrefix(pRows, 'z', -1) === -1)
+
+check('S8 providerRowsOf 成功行保持目录顺序', (() => {
+  const rows = providerRowsOf({ groups: [{ id: 'b', name: 'Bee', models: [{ id: 'm1' }] }, { id: 'a', name: 'Ay', models: [{ id: 'm2' }] }] })
+  return rows.length === 2 && rows[0].id === 'b' && rows[1].id === 'a'
+    && rows[0].disabled === false && rows[0].failure === false
+})())
+check('S8 providerRowsOf 空 models 行 disabled', (() => {
+  const rows = providerRowsOf({ groups: [{ id: 'a', name: 'Ay', models: [] }] })
+  return rows.length === 1 && rows[0].disabled === true
+})())
+check('S8 providerRowsOf failures 追加为 disabled', (() => {
+  const rows = providerRowsOf({ groups: [{ id: 'a', name: 'Ay', models: [{ id: 'm' }] }], failures: [{ id: 'dead', name: 'Dead', message: 'boom' }] })
+  return rows.length === 2 && rows[1].id === 'dead' && rows[1].disabled === true
+    && rows[1].failure === true && rows[1].message === 'boom'
+})())
+check('S8 providerRowsOf 空目录 → []', providerRowsOf(null).length === 0 && providerRowsOf({}).length === 0)
+check('S8 nextEnabledIndex 跳过 disabled 与空 models 行', (() => {
+  const rows = [{ id: 'a', models: [] }, { id: 'b', models: [{ id: 'm' }] }, { id: 'c', models: [{ id: 'n' }] }]
+  return nextEnabledIndex(rows, -1, 1) === 1 && nextEnabledIndex(rows, 1, 1) === 2
+})())
+
+check('S8 faceOf.select 代理同一 directory.select', (() => {
+  const before = selectCalls.length
+  face.select({ provider: 'provider-alpha', model: 'model-x' })
+  return selectCalls.length === before + 1 && selectCalls[selectCalls.length - 1].model === 'model-x'
+})())
+await (async () => {
+  const res = await face.select({ provider: 'provider-alpha', model: 'model-x' })
+  check('S8 faceOf.select 成功 result.ok !== false', res !== null && res.ok !== false)
+})()
+await (async () => {
+  const noSelectCtx = makeCtx({ sessions: plainSessions, models: { directoryFor: () => ({ store: fakeStore }) } })
+  const f = faceOf(noSelectCtx, 's1')
+  const res = await f.select({ provider: 'x', model: 'y' })
+  check('S8 faceOf 缺 select → ok:false select/unavailable', res.ok === false && res.error.code === 'select/unavailable')
+})()
+check('S8 faceOf 目录异常 → UNAVAILABLE 无 select', !('select' in faceOf(throwCtx, 's1')))
+
+/* ── S8b：弹层内滚动不关闭（shouldCloseOnScroll + 源码形状） ─────────── */
+
+const hitNode = (selector) => ({ closest: (sel) => (sel === selector ? {} : null) })
+check('S8b shouldCloseOnScroll 弹层内 → false', shouldCloseOnScroll(hitNode('[data-provider-badge-cascade], [data-provider-badge-root]')) === false)
+check('S8b shouldCloseOnScroll 徽标 root 内 → false', (() => {
+  const node = { parent: true, closest: (sel) => (sel.includes('[data-provider-badge-root]') ? { tag: 'root' } : null) }
+  return shouldCloseOnScroll(node) === false
+})())
+check('S8b shouldCloseOnScroll document（无 closest）→ true', shouldCloseOnScroll({ documentElement: {} }) === true)
+check('S8b shouldCloseOnScroll null → true', shouldCloseOnScroll(null) === true && shouldCloseOnScroll(undefined) === true)
+check('S8b shouldCloseOnScroll closest 抛错 → true', shouldCloseOnScroll({ closest: () => { throw new Error('boom') } }) === true)
+
+check('S8b 源码：scroll 监听使用 shouldCloseOnScroll', /window\.addEventListener\(\s*["']scroll["']\s*,\s*closeOnScroll\s*,\s*true\s*\)/.test(source)
+  && /shouldCloseOnScroll\(\s*target\s*\)/.test(source))
+check('S8b 源码：PANEL_BASE_STYLE 含 overscrollBehavior contain', (() => {
+  const m = source.match(/PANEL_BASE_STYLE\s*=\s*\{([\s\S]*?)\n\s*\};/)
+  return m !== null && /overscrollBehavior\s*:\s*["']contain["']/.test(m[1])
+})())
+check('S8b 源码：面板仍为 maxHeight + overflowY auto', (() => {
+  const m = source.match(/PANEL_BASE_STYLE\s*=\s*\{([\s\S]*?)\n\s*\};/)
+  return m !== null && /maxHeight\s*:/.test(m[1]) && /overflowY\s*:\s*["']auto["']/.test(m[1])
+})())
 
 /* ── 汇总 ─────────────────────────────────────────────────────────── */
 
