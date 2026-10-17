@@ -8,7 +8,7 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
   provider 徽标（4 字母，黑体；白字优先浅底改深墨；点徽标开级联菜单）
 
 级联菜单一级（provider 列，宽 260px）：
-  OpenAI Codex (official)   5h 4% · 7d 35%            >
+  gpt（official）            5h 4% · 7d 35%            >
   Kimi (official)           5h 0% · 7d 100%           >
   OpenCode Go               5h 6% · 7d 36% · 30d 59%  >
                                     ↑

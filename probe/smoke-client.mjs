@@ -427,7 +427,7 @@ const labelState = (routeId, name) => ({
 })
 check('S5e deepseek-official → ds官', badgeOf(labelState('deepseek-official', 'DeepSeek Official')).text === 'ds官')
 check('S5e codex-relay → a1gpt', badgeOf(labelState('codex-relay', 'Codex Relay')).text === 'a1gpt')
-check('S5e openai-codex → gpt官', badgeOf(labelState('openai-codex', 'OpenAI Codex (official)')).text === 'gpt官')
+check('S5e openai-codex → gpt官', badgeOf(labelState('openai-codex', 'gpt（official）')).text === 'gpt官')
 check('S5e anthropic-relay → claude', badgeOf(labelState('anthropic-relay', 'Anthropic Relay')).text === 'claude')
 check('S5e opencode-go → opengo（允许超 4 字符）', badgeOf(labelState('opencode-go', 'OpenCode Go')).text === 'opengo')
 check('S5e kimi-coding → kimi官', badgeOf(labelState('kimi-coding', 'Kimi Coding')).text === 'kimi官')
@@ -763,7 +763,7 @@ const quotaRenderState = {
   status: 'ready',
   current: { provider: 'openai-codex', model: 'gpt-5.6-sol' },
   groups: [
-    { id: 'openai-codex', name: 'OpenAI Codex (official)', models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }] },
+    { id: 'openai-codex', name: 'gpt（official）', models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }] },
     { id: 'ais-2dsglm', name: 'AIS 2DSGLM', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] },
   ],
 }
