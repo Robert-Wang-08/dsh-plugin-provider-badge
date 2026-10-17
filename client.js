@@ -120,6 +120,186 @@ window.__ModuleLoader__.load({
     /** localStorage 持久化键：路由 id → 用户所选底色（JSON 对象）。 */
     const STORAGE_KEY = "dsh-plugin-provider-badge:colors";
 
+    /* ── 额度：宿主端点 + 文案纯函数（probe 直接断言） ─────────────────── */
+
+    /**
+     * 额度端点（宿主半）。整表取回形如
+     * `{ ok, updatedAt, routes: { <routeId>: <entry> } }`；条目不可用时
+     * `entry.ok === false`，宿主不解释原因，浏览器半一律不渲染。
+     */
+    const QUOTA_ENDPOINT = "/provider-badge/quota";
+
+    /** 客户端缓存窗口：小于宿主的 60s 上游缓存窗口，重开菜单时最多补一次请求。 */
+    const QUOTA_CLIENT_TTL_MS = 25000;
+
+    /**
+     * 模块级额度缓存：重开菜单、多实例复用同一份数据，避免每次点开都打一次
+     * 端点。`at` 是客户端取到数据的时刻（不是服务端 updatedAt），只用于 TTL。
+     */
+    const quotaCache = { at: 0, routes: null };
+
+    /** 用量色调：只按「最紧的那个窗口」定级，避免两个窗口互相掩盖。 */
+    const QUOTA_TONES = { normal: null, warn: "#ffcf7a", danger: "#ff9b9b" };
+
+    /**
+     * 秒数 → 窗口标签。按**时长**判定，不按上游 primary/secondary 角色：
+     * 角色与「5 小时 / 7 天」的对应关系会变，时长不会。18000→"5h"、
+     * 604800→"7d"、3600→"1h"、1800→"30m"；非正数/非数值 → null。
+     */
+    function formatWindowSpan(seconds) {
+      if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return null;
+      const total = Math.round(seconds);
+      if (total % 86400 === 0) return String(total / 86400) + "d";
+      if (total % 3600 === 0) return String(total / 3600) + "h";
+      if (total % 60 === 0) return String(total / 60) + "m";
+      return String(total) + "s";
+    }
+
+    /** 秒数 → 倒计时短文案（"2d3h" / "3h42m" / "12m"）；非数值 → null。 */
+    function formatCountdown(seconds) {
+      if (typeof seconds !== "number" || !Number.isFinite(seconds)) return null;
+      let rest = Math.max(0, Math.round(seconds));
+      const days = Math.floor(rest / 86400); rest -= days * 86400;
+      const hours = Math.floor(rest / 3600); rest -= hours * 3600;
+      const minutes = Math.floor(rest / 60);
+      if (days > 0) return hours > 0 ? days + "d" + hours + "h" : days + "d";
+      if (hours > 0) return minutes > 0 ? hours + "h" + minutes + "m" : hours + "h";
+      return Math.max(1, minutes) + "m";
+    }
+
+    /**
+     * 额度条目 → 窗口列表（按时长升序，5h 在 7d 前）。
+     * 条目不可用、缺字段、时长无法成标签的一律丢弃：宁可不显示，也不拿不完整
+     * 的数据凑一个百分比。
+     * @param entry - 宿主返回的条目。
+     * @returns [{ label, usedPercent, windowSeconds, resetsAt, resetAfterSeconds }]。
+     */
+    function quotaWindowsOf(entry) {
+      if (entry === null || typeof entry !== "object" || entry.ok !== true) return [];
+      const list = Array.isArray(entry.windows) ? entry.windows : [];
+      const out = [];
+      for (const raw of list) {
+        if (raw === null || typeof raw !== "object") continue;
+        const used = typeof raw.usedPercent === "number" && Number.isFinite(raw.usedPercent) ? raw.usedPercent : null;
+        const label = formatWindowSpan(raw.windowSeconds);
+        if (used === null || label === null) continue;
+        out.push({
+          label,
+          usedPercent: Math.min(100, Math.max(0, used)),
+          windowSeconds: raw.windowSeconds,
+          resetsAt: typeof raw.resetsAt === "number" && raw.resetsAt > 0 ? raw.resetsAt : null,
+          resetAfterSeconds: typeof raw.resetAfterSeconds === "number" && raw.resetAfterSeconds >= 0 ? raw.resetAfterSeconds : null,
+        });
+      }
+      out.sort((a, b) => a.windowSeconds - b.windowSeconds);
+      return out;
+    }
+
+    /** 额度条目 → 行内文案（"5h 4% · 7d 35%"）；无可用窗口 → null。 */
+    function quotaTextOf(entry) {
+      const windows = quotaWindowsOf(entry);
+      if (windows.length === 0) return null;
+      return windows.map((w) => w.label + " " + Math.round(w.usedPercent) + "%").join(" · ");
+    }
+
+    /**
+     * 额度条目 → 行内文案（百分比 + 最紧窗口的剩余重置时间）。
+     * 保留 `quotaTextOf` 的纯百分比契约；只有真实行渲染使用这个更完整的版本，
+     * 这样现有 title/测试与其它调用方仍保持稳定，同时避免三窗口全部展开导致列过宽。
+     */
+    function quotaInlineTextOf(entry) {
+      const windows = quotaWindowsOf(entry);
+      if (windows.length === 0) return null;
+      const text = windows.map((w) => w.label + " " + Math.round(w.usedPercent) + "%").join(" · ");
+      const nowSeconds = Date.now() / 1000;
+      let shortest = null;
+      for (const w of windows) {
+        const remaining = w.resetsAt !== null
+          ? w.resetsAt - nowSeconds
+          : (w.resetAfterSeconds !== null ? w.resetAfterSeconds : null);
+        if (typeof remaining !== "number" || !Number.isFinite(remaining)) continue;
+        if (shortest === null || remaining < shortest) shortest = remaining;
+      }
+      const countdown = shortest === null ? null : formatCountdown(shortest);
+      return countdown === null ? text : text + " · 重置 " + countdown;
+    }
+
+    /**
+     * 分 → 金额文案。符号表照抄常见口径，表外货币回退 "12.34 XYZ" 形式；
+     * cents 非数值 → null（不显示这一段）。
+     */
+    const CURRENCY_SYMBOLS = { CNY: "¥", USD: "$", EUR: "€", GBP: "£", JPY: "¥" };
+    function formatMoney(cents, currency) {
+      if (typeof cents !== "number" || !Number.isFinite(cents)) return null;
+      const code = typeof currency === "string" && currency.length > 0 ? currency : "USD";
+      const amount = (cents / 100).toFixed(2);
+      const symbol = CURRENCY_SYMBOLS[code];
+      return typeof symbol === "string" ? symbol + amount : amount + " " + code;
+    }
+
+    /**
+     * 账单口径（Extra Usage）→ 悬停说明片段数组。
+     * Kimi 的「月度」维度是钱不是用量窗口：`本月已用 ¥x · 月度上限 ¥y|Unlimited ·
+     * 加购余额 ¥z`。钱包状态非 STATUS_ACTIVE 时追加标注（CLI 忽略 status，本插件
+     * 不忽略：本机 `STATUS_DISABLED` 的余额若不加标注会被当成可用余额）。
+     * @param raw - 宿主条目里的 `extraUsage`。
+     * @returns 片段数组（可能为空）。
+     */
+    function extraUsageParts(raw) {
+      if (raw === null || typeof raw !== "object") return [];
+      const currency = typeof raw.currency === "string" && raw.currency.length > 0 ? raw.currency : "USD";
+      const parts = [];
+      const used = formatMoney(raw.monthlyUsedCents, currency);
+      if (used !== null) parts.push("本月已用 " + used);
+      if (raw.monthlyChargeLimitEnabled === true && typeof raw.monthlyChargeLimitCents === "number") {
+        const limit = formatMoney(raw.monthlyChargeLimitCents, currency);
+        parts.push("月度上限 " + (limit !== null ? limit : "Unlimited"));
+      } else {
+        parts.push("月度上限 Unlimited");
+      }
+      let balance = formatMoney(raw.balanceCents, currency);
+      if (balance !== null) {
+        const status = typeof raw.status === "string" && raw.status.length > 0 ? raw.status : null;
+        if (status !== null && status !== "STATUS_ACTIVE") {
+          balance += "（" + (status === "STATUS_DISABLED" ? "钱包已停用 " : "钱包状态 ") + status + "）";
+        }
+        parts.push("加购余额 " + balance);
+      }
+      return parts;
+    }
+
+    /** 额度条目 → 悬停说明（窗口用量 + 重置倒计时 + 套餐 + 余额 + 账单）；无窗口 → null。 */
+    function quotaTitleOf(entry) {
+      const windows = quotaWindowsOf(entry);
+      if (windows.length === 0) return null;
+      const nowSeconds = Date.now() / 1000;
+      const parts = windows.map((w) => {
+        const remaining = w.resetsAt !== null
+          ? formatCountdown(w.resetsAt - nowSeconds)
+          : (w.resetAfterSeconds !== null ? formatCountdown(w.resetAfterSeconds) : null);
+        const head = w.label + " 已用 " + Math.round(w.usedPercent) + "%";
+        return remaining !== null ? head + "，" + remaining + "后重置" : head;
+      });
+      if (typeof entry.plan === "string" && entry.plan.length > 0) parts.push("套餐 " + entry.plan);
+      const credits = entry.credits !== null && typeof entry.credits === "object" ? entry.credits : null;
+      if (credits !== null && credits.hasCredits === true) {
+        parts.push(typeof credits.balance === "string" && credits.balance.length > 0 ? "余额 " + credits.balance : "有额外余额");
+      }
+      for (const part of extraUsageParts(entry.extraUsage)) parts.push(part);
+      return parts.join(" · ");
+    }
+
+    /** 额度条目 → 色调（"normal" / "warn" / "danger"）；无可用窗口 → null。 */
+    function quotaToneOf(entry) {
+      const windows = quotaWindowsOf(entry);
+      if (windows.length === 0) return null;
+      let worst = 0;
+      for (const w of windows) worst = Math.max(worst, w.usedPercent);
+      if (entry.limitReached === true || worst >= 90) return "danger";
+      if (worst >= 70) return "warn";
+      return "normal";
+    }
+
     /**
      * 调色板（v2）：12 个色相槽均匀铺轮、刻意只留 2 个蓝段（218/248），并配
      * 不同的饱和/明度；槽间由分配算法保证距离。字色由 inkFor 按底色对比度选。
@@ -389,20 +569,21 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 级联菜单定位（spec §3/§7）：providerWidth 176、modelWidth 236、gap 6、
+     * 级联菜单定位（spec §3/§7）：providerWidth 260、modelWidth 236、gap 6、
      * panelHeight 340、视口边距 8。
      * 模型列**始终位于 provider 右侧**（列顺序不翻转）：水平按两列总宽定位，
      * 右侧空间不足时整体容器左移；仍不足则按视口宽度收窄（provider 最窄约
      * 132px、model 取剩余宽度并在 CSS 端 ellipsis），最终整体夹取在视口 8px
      * 边距内。绝不返回左侧模型列（不翻左）。
      * 垂直：优先锚点上方（composer 多在底部），上方不足才下方，最终 clamp。
+     * 默认列宽与 CASCADE_PROVIDER_WIDTH / CASCADE_MODEL_WIDTH 同值（一处改名两处改）。
      * @param anchor - 徽标视口矩形（至少 left/top/bottom），缺失时安全回退 0。
      * @param viewport - { width, height }，缺失/非法时按 0 处理。
      * @returns { left, top, totalWidth, providerWidth, modelWidth }：整个级联
      *   容器（两列并排）的 fixed 原点与各列宽度。
      */
     function cascadePositionFor(anchor, viewport, providerWidth, modelWidth, gap, panelHeight) {
-      const w1 = typeof providerWidth === "number" ? providerWidth : 176;
+      const w1 = typeof providerWidth === "number" ? providerWidth : 260;
       const w2 = typeof modelWidth === "number" ? modelWidth : 236;
       const g = typeof gap === "number" ? gap : 6;
       const ph = typeof panelHeight === "number" ? panelHeight : 340;
@@ -653,7 +834,11 @@ window.__ModuleLoader__.load({
     const snapshotNull = () => null;
     const serverSnapshotNull = () => null;
 
-    const CASCADE_PROVIDER_WIDTH = 176;
+    // provider 列 176 → 200 → 260：额度文案常驻该列右侧，"5h 4% · 7d 35%" 要 200px，
+    // 三窗口的 "5h 6% · 7d 36% · 30d 59%"（OpenCode Go）约 25 字符，200px 下显示名
+    // 会被挤没，故再放到 260px。定位算法对宽度是参数化的，极窄视口下仍走
+    // cascadePositionFor 的收窄分支。
+    const CASCADE_PROVIDER_WIDTH = 260;
     const CASCADE_MODEL_WIDTH = 236;
     const CASCADE_GAP = 6;
     const CASCADE_PANEL_HEIGHT = 340;
@@ -748,12 +933,44 @@ window.__ModuleLoader__.load({
       const [modelIndex, setModelIndex] = useState(0);
       const [localError, setLocalError] = useState(null);
       const [pendingSelection, setPendingSelection] = useState(null);
+      // 额度：整表（路由 id → 条目）。lazy 初值直接读模块缓存，重开菜单即时可用。
+      const [quotaRoutes, setQuotaRoutes] = useState(() => quotaCache.routes);
       const keyBufferRef = useRef({ text: "", at: 0 });
       const badgeRef = useRef(null);
 
       useEffect(() => {
         if (typeof face.load === "function") face.load();
       }, [face.load]);
+
+      // 打开级联时补一次额度（既有缓存且未过期就跳过）。
+      // 额度取数失败一律静默：它是锦上添花，不能挡住模型选择。
+      const cascadeOpen = cascade !== null;
+      useEffect(() => {
+        if (!cascadeOpen) return undefined;
+        if (typeof fetch !== "function") return undefined;
+        if (quotaCache.routes !== null && Date.now() - quotaCache.at < QUOTA_CLIENT_TTL_MS) return undefined;
+        let cancelled = false;
+        const run = async () => {
+          try {
+            const response = await fetch(QUOTA_ENDPOINT, {
+              headers: { accept: "application/json" },
+              signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+                ? AbortSignal.timeout(15000)
+                : undefined,
+            });
+            if (response === null || response === undefined || response.ok !== true) return;
+            const data = await response.json();
+            const routes = data !== null && typeof data === "object"
+              && data.routes !== null && typeof data.routes === "object" ? data.routes : null;
+            if (cancelled) return;
+            quotaCache.at = Date.now();
+            quotaCache.routes = routes;
+            setQuotaRoutes(routes);
+          } catch (_) { /* 端点不可用/网络失败：保持无额度渲染 */ }
+        };
+        run();
+        return () => { cancelled = true; };
+      }, [cascadeOpen]);
 
       const closeAll = () => {
         setCascade(null);
@@ -1116,6 +1333,30 @@ window.__ModuleLoader__.load({
           if (isCurrent) rowStyle.fontWeight = 700;
           let trailing = row.failure ? "!" : ">";
           if (isPending) trailing = "…";
+          // 额度：只对宿主报告了可用条目的路由渲染。本半不认识具体 provider：
+          // 命中 row.id 即可渲染（openai-codex / kimi-coding 走同一段代码）。
+          const quotaEntry = quotaRoutes !== null && typeof quotaRoutes === "object"
+            && Object.prototype.hasOwnProperty.call(quotaRoutes, row.id) ? quotaRoutes[row.id] : null;
+          const quotaText = quotaInlineTextOf(quotaEntry);
+          const quotaTone = quotaText !== null ? quotaToneOf(quotaEntry) : null;
+          const quotaColor = quotaTone !== null ? QUOTA_TONES[quotaTone] : null;
+          const quotaTitle = quotaText !== null ? quotaTitleOf(quotaEntry) : null;
+          const quotaEl = quotaText === null ? null : h("span", {
+            key: "quota",
+            "data-provider-badge-quota": row.id,
+            title: quotaTitle !== null ? quotaTitle : undefined,
+            style: {
+              marginLeft: "8px",
+              flex: "none",
+              fontSize: "10px",
+              lineHeight: "12px",
+              fontVariantNumeric: "tabular-nums",
+              whiteSpace: "nowrap",
+              letterSpacing: "0",
+              color: quotaColor !== null ? quotaColor : "inherit",
+              opacity: quotaColor === null ? 0.62 : 1,
+            },
+          }, quotaText);
           return h("div", {
             key: row.id + ":" + index,
             role: "option",
@@ -1132,7 +1373,10 @@ window.__ModuleLoader__.load({
               setFocusLevel("models");
             },
           },
-          h("span", { key: "name", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, row.name),
+          // name 需要 minWidth:0 + flex 才能让 ellipsis 生效：额度占住右侧固定宽度后，
+          // 长显示名必须让位而不是把额度挤出列宽。
+          h("span", { key: "name", style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, row.name),
+          quotaEl,
           h("span", { key: "sym", style: { marginLeft: "8px", opacity: 0.7, flex: "none" } }, trailing),
           );
         });
@@ -1287,6 +1531,9 @@ window.__ModuleLoader__.load({
       badgeOf, faceOf, UNAVAILABLE,
       selectionFor, cascadePositionFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
       shouldCloseOnScroll,
+      QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,
+      formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaTitleOf, quotaToneOf,
+      formatMoney, extraUsageParts, CURRENCY_SYMBOLS,
     };
 
     exports.apply = apply;

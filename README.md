@@ -1,11 +1,18 @@
 # dsh-plugin-provider-badge 说明
 
-DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会话输入区的「模型及推理等级」选择器正前方渲染一个 **provider 徽标**。本轮实现与探针基于宿主 `0.2.0-rc.2`。
+DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会话输入区的「模型及推理等级」选择器正前方渲染一个 **provider 徽标**，并在点开的 provider 级联菜单里为支持的路由显示 **可用额度**（当前为 OpenAI Codex、Kimi、OpenCode Go 三家的窗口用量）。本轮实现与探针基于宿主 `0.2.0-rc.2`。
 
 ```
 [AGLM] my-model ▾   ···   [发送]
   ↑
   provider 徽标（4 字母，黑体；白字优先浅底改深墨；点徽标开级联菜单）
+
+级联菜单一级（provider 列，宽 260px）：
+  OpenAI Codex (official)   5h 4% · 7d 35%            >
+  Kimi (official)           5h 0% · 7d 100%           >
+  OpenCode Go               5h 6% · 7d 36% · 30d 59%  >
+                                    ↑
+                                    可用额度（仅宿主报告了额度的路由才有；悬停看重置倒计时与套餐）
 ```
 
 ## 行为
@@ -21,12 +28,16 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 | 失败 | 选择失败时面板**保持打开**并在一级面板内显示错误（`session/writer-held` → `会话正被其他 DSH 占用`；否则 `result.error.message` / `state.error` / `模型切换失败`）；选择成功关闭级联并把焦点交回徽标；选择进行中不允许重复提交，但 `Escape` 仍可关闭 |
 | 悬停 | title 显示 `显示名 (路由id)`（无显示名时仅路由 id） |
 | 跟随 | 数据来自官方共享目录 store（`ctx.modelDirectories`，与模型席位/`/model` 弹层同源），会话内切换模型/路由即时跟随 |
-| 降级 | subagent 转址会话、`modelDirectories` 未装载、目录解析抛错、无当前选择 → 渲染为空，不报错不占位 |
+| 额度 | 仅当宿主半的 `GET /provider-badge/quota` 报告了该路由的可用额度时，在该 provider 行右侧渲染 `5h 4% · 7d 35% · 重置 3h29m`（**已用**百分比 + 最紧窗口剩余重置时间，10px、tabular-nums、不收缩），悬停显示每个窗口的完整倒计时：`5h 已用 4%，3h29m后重置 · 7d 已用 35%，5d6h后重置 · 套餐 plus`（有额外余额时追加余额）。窗口标签按窗口**时长**判定（18000→`5h`、604800→`7d`、2592000→`30d`），不按上游 primary/secondary 角色，也**不限窗口个数**；数值 ≥70% 转琥珀、≥90% 或已达上限转红（按最紧的窗口定级）。取数在**打开级联时**触发（客户端缓存 25s、宿主上游缓存 60s），失败/不可用**完全不渲染**，不影响模型选择。已接入数据源：`openai-codex`（5h/7d，含套餐名）、`kimi-coding`（5h/7d + 账单段）、`opencode-go`（5h/7d/30d 三窗口）；浏览器半不认识具体 provider，命中行 id 即渲染 |
+| 账单段 | 条目带 `extraUsage`（当前只有 Kimi）时，悬停说明**末尾**追加 `本月已用 ¥0.00 · 月度上限 Unlimited · 加购余额 ¥32.77`；钱包状态非 `STATUS_ACTIVE` 时余额后标注（如 `（钱包已停用 STATUS_DISABLED）`）。**只进悬停说明**，行内文本与列宽零影响；`extraUsage` 缺失或字段不全时该段整体不出现 |
+| 降级 | subagent 转址会话、`modelDirectories` 未装载、目录解析抛错、无当前选择 → 渲染为空，不报错不占位；额度端点不可达、返回 `ok:false`（未配置 / 令牌过期 / 上游非 200 / 网络失败）→ 该行不显示额度，其余行为零变化 |
 
 ## 明确非目标
 
 - **不反映运行期故障转移重路由**：分档切换对 UI 透明是既有设计；徽标与官方模型席位同口径，反映**会话选择**的 provider。
 - 不写 settings、不持凭据、不发起任何变更类请求；唯一本地写入是 `localStorage` 选色（每路由可恢复自动配色）。
+- **额度只读，且不代管凭据**：宿主半读 `llm-pi-ai` 拥有的凭据记录或该路由生效的 `apiKeyEnv` 引用，只做一次只读 GET，**不刷新、不写回、不落盘、不写日志**；令牌临期/过期时直接放弃本次查询（`token-expired`），把刷新留给 pi-ai —— 两处并发刷新会互相作废对方的 refresh token（凭据服务的 `modifyRecord` 就是为此串行化）。额度取数失败不产生任何用户可见的错误提示。同理**不读 Kimi CLI 的 `~/.kimi-code/credentials/kimi-code.json`**：那份 OAuth 令牌实测 401，且刷新它会与 Kimi CLI 抢同一份 refresh token。
+- 额度**不改变预算/计费口径**：窗口显示的是上游报告的**已用百分比**，不是本机 token 计费估算；两者不可互相换算。Kimi 悬停里的账单段（本月已用 / 月度上限 / 加购余额）确实是**钱**，但它同样是上游直接给的字段（本插件不折算、不估算）；若钱包未启用，它显示 `Unlimited` 而不是编一个上限。OpenCode Go 尤其要注意：官方是按**模型**给月度美元上限（$15/$30/$60/$80 不等），而 `/usage` 只回**订阅级**三个窗口的百分比 —— 本插件显示的是后者，**不做按模型的美元换算**，也不显示「哪个模型还剩多少」。
 - 不遮蔽任何官方席位；官方模型选择器行为零改变。级联的模型读取与提交复用官方共享目录**同一个 `ctx.modelDirectories.directoryFor(sessionId)`**（`store`/`load`/`select` 同源，官方同口径 `selectionOf`），不新增 RPC、不写 settings，官方 `/model` 弹窗与 composer 模型席位零改变。
 - 级联打开期间**页面**滚动与窗口 `resize` **直接关闭**（不重算锚点，避免 fixed 定位漂移），重新点击徽标即可再次打开。**弹层（provider/模型列表）内部滚动不再关闭弹层**：`scroll` 事件虽不冒泡但会在捕获阶段自 `window` 下传，监听器经 `shouldCloseOnScroll(event.target)` 判定，目标命中 `[data-provider-badge-cascade]`/`[data-provider-badge-root]` 时跳过关闭。
 - 模型列表很长时可**用鼠标滚轮或拖动滚动条**上下滚动：面板保留 `maxHeight: 340px` + `overflowY: auto`（列表自身出现滚动条），并设 `overscrollBehavior: contain`，滚到列表末端不串联滚动页面（否则页面一滚又会关闭弹层）。
@@ -45,7 +56,48 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 # 4. 重启 dsh web + 浏览器硬刷新
 ```
 
-插件自带 `cordis.patch.yml`（经 `dsh.bundle.patch` 插入 host 载体行 `provider-badge`），无需手改 profile 的 cordis.patch.yml。新增级联选择器为同一插件内的客户端改动，**安装步骤与依赖零变化**，无需改动 `package.json` / profile。
+插件自带 `cordis.patch.yml`（经 `dsh.bundle.patch` 插入 host 载体行 `provider-badge`），无需手改 profile 的 cordis.patch.yml。新增级联选择器与额度为同一插件内的改动，**安装步骤与依赖零变化**，无需改动 profile。
+
+## 额度（官方 provider）
+
+宿主半注册只读端点 `GET /provider-badge/quota`，浏览器半在打开级联时整表取回。数据源在 `index.js` 顶部的 `QUOTA_SOURCES`（路由 id → 数据源）里登记；新增一条只需在此加一项（鉴权类型 + URL + 附加请求头 + 响应解析），浏览器半无需知道路由名。
+
+### 数据源
+
+| 路由 | 上游 | 凭据来源（一律**只读**） | 附加请求头 |
+| --- | --- | --- | --- |
+| `openai-codex` | `https://chatgpt.com/backend-api/wham/usage` | 宿主凭据记录 `llm-pi-ai/openai-codex`（`kind: grant`，payload `{type:'oauth',access,refresh,expires,accountId}`） | `chatgpt-account-id: <accountId>`、`originator: pi`（与 pi-ai 的 Codex 适配器同口径） |
+| `kimi-coding` | `https://api.kimi.com/coding/v1/usages` | settings `llm-pi-ai.providers['kimi-coding'].apiKeyEnv` 指向的凭据引用（本机在 profile 的 `cordis.patch.yml` 里声明为 `LLMKEY_KIMI`，runtime 由 `settings.describe()` 暴露），取不到时回退 `KIMI_API_KEY` | 无（只发 `authorization` / `accept`） |
+| `opencode-go` | `https://opencode.ai/inference/go/v1/usage`（`/zen/go/v1/usage` 是实测同源别名，DSH 内置目录用的是后者） | settings `llm-pi-ai.providers['opencode-go'].apiKeyEnv` 指向的凭据引用（本机为 `OPENCODE_API_KEY`），取不到时回退 `OPENCODE_API_KEY` | 无（只发 `authorization` / `accept`） |
+
+### 端点契约
+
+| 项 | 值 |
+| --- | --- |
+| 响应 | `{ ok, updatedAt, routes: { <routeId>: <entry> } }`；`<entry>` 形如 `{ok, plan, limitReached, windows:[{windowSeconds,usedPercent,resetsAt,resetAfterSeconds}], credits, fetchedAt}`，失败为 `{ok:false, reason}`，`reason ∈ {unsupported, credentials-unavailable, credentials-error, not-configured, token-expired, network, http-<code>, bad-json, no-windows, unexpected}` |
+| 可选字段 | Kimi 条目另带 `extraUsage: {totalCents, balanceCents, monthlyUsedCents, monthlyChargeLimitCents, monthlyChargeLimitEnabled, currency, status}`（账单口径，只进悬停说明）或 `null`；其它数据源不带该字段。账单对象**刻意不含钱包 id / userId** |
+| 缓存 | 宿主侧 60s（并单飞合并并发请求）、客户端侧 25s；收到 `credentials/record-updated` 时立刻失效对应路由缓存 |
+| 安全 | 端点只应答回环请求（非回环 403、非 GET 405）；上游非 200 只回状态码不回响应体；任何响应都不含令牌、邮箱、账号 id |
+
+### 各数据源的口径
+
+**Codex**：`rate_limit.primary_window` / `secondary_window` 的 `used_percent` + `limit_window_seconds` + `reset_at`/`reset_after_seconds`；窗口按**时长**排（上游把 5h 放 primary 还是 secondary 都识别）；`plan_type` 作套餐名；`limit_reached` 透传；`credits` 抽 `has_credits`/`unlimited`/`balance`。同一 token 打 `/backend-api/codex/usage` 实测回 403（HTML 错误页），`/wham/usage` 回 200 JSON。
+
+**Kimi**：用量窗口只有 **5h 与 7d 两个维度**，首选 `usages.limit_5h` / `limit_7d`（键自带窗口时长，`used_ratio` 是 0..1 比例 → ×100，`reset_time` 是 ISO 时刻）；`usages` 缺席时回退 `limits[]`（`limit`/`remaining`/`used` 计数 + `window.duration` × `window.timeUnit`），再兜底裸 `usage`（无窗口信息，按 7 天）。**实测该端点没有 30 天用量窗口**（`usages` 只有 `limit_5h`/`limit_7d`，`limits[]` 只有一条 300 分钟；Kimi CLI 的窗口来源同样只有顶层 `usage`（它标为 `Weekly limit`）与 `limits[]`），所以徽标行不会出现 `30d`。Kimi 不提供套餐名与「已达上限」标志，故 `plan` 恒为 `null`、`limitReached` 由「有窗口已用满」推导。
+
+**Kimi 的「月度」维度是账单（Extra Usage），不是用量窗口**：`booster_wallet` 的 `balance` / `monthlyUsed` / `monthlyChargeLimit` 是**钱**（`1e6` 定点，`priceInCents` 为分），Kimi CLI 把它渲染成 `Used this month` / `Monthly limit` / `Balance` 三行。本插件按其口径在**悬停说明**里追加同样三段（本机实测：`本月已用 ¥0.00 · 月度上限 Unlimited · 加购余额 ¥32.77`），**不伪装成第三个百分比窗口**。字段语义与换算全部取自 Kimi CLI 自己的实现（`1e6` 定点 → 分、不足 1 分算 1 分；`type === 'BOOSTER'` 且 `amount > 0` 才显示；`monthlyChargeLimitEnabled === true` 且上限 > 0 才显示上限，否则 `Unlimited`）。**刻意比 CLI 多一步**：`status` 非 `STATUS_ACTIVE` 时在余额后标注（CLI 忽略 status，会把本机 `STATUS_DISABLED` 的余额当成可用余额显示）。
+
+实测：DSH 的 `LLMKEY_KIMI` 回 200（5h 0% · 7d 100%），而 Kimi CLI 自己的 `~/.kimi-code/credentials/kimi-code.json` 令牌回 401 —— 且刷新它会与 Kimi CLI 抢同一份 refresh token，故**不采用**该文件。
+
+**OpenCode Go**：`usage.rolling` / `usage.weekly` / `usage.monthly` 三个窗口，各含 `{status, percent, resetsAt}`。响应**不带窗口时长**，时长按官方文档口径固定映射：5 小时（rolling，= 月度上限的 20%）、每周（50%）、每月（100%，按 30 天 → 标签 `30d`）。`percent` 直接用（实测 6 / 36 / 59）。上游只给**订阅级**百分比，**不按模型拆**（文档里月上限虽按模型分 $15/$30/$60/$80，该端点不暴露）；`status` 实测恒为 `"ok"`，本插件按「非 `ok` 即视为已达上限」处理（**未验证非 ok 取值**，按失败闭合：最坏只是提前转红）。上游不给套餐名（Go 与 Go Plus 无法区分），故 `plan` 恒为 `null`；无余额字段。实测：`OPENCODE_API_KEY` 回 200，无 key / 错 key 回 **401 AuthError**（绑定到该 key）。该端点**未出现在官方 Console API 文档**里（文档只列 Inference / Providers / Budgets / Config，并说用量去 console 网页看），属于「实测存在但未公开」，故纳入静默降级。
+
+### 耦合风险（已知且刻意）
+
+- `llm-pi-ai/openai-codex` 是 pi-ai 拥有的记录，payload 是它的私有格式；pi-ai 若改字段名，额度会**静默消失**（不报错、不影响选择），届时更新 `entryFromPayload` 取值即可。
+- Kimi 的 `usages`/`limits` 形状是 Kimi 服务的私有格式，同样只读、同样静默降级。
+- 用户在 settings 里改 `apiKeyEnv`（换引用）后，本插件在一个缓存窗口内（≤60s）可能仍显示旧引用的额度，之后自然纠正；记录型凭据（Codex）则由 `credentials/record-updated` 立即失效。
+- `opencode.ai/inference/go/v1/usage` **不在官方 API 文档的端点表里**，也没有版本承诺：它一旦改名/加鉴权，额度就静默消失（不影响模型调用，因为那走的是另一个端点）。三个窗口的**时长也是按文档口径硬编码**的（响应里没有 duration 字段），若官方调整窗口定义（例如把 rolling 从 5 小时改成 3 小时），显示会把标签算错——数值仍是对的，标签会错。
+
 
 ## 卸载
 
@@ -54,9 +106,12 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 ## 验证
 
 ```powershell
-node probe/smoke-client.mjs   # 交付形状 + 推导/颜色 + face 降级 + 级联纯函数（期望 ALL PASSED）
+node probe/smoke-client.mjs   # 交付形状 + 推导/颜色 + face 降级 + 级联/额度纯函数与渲染（期望 ALL PASSED）
+node probe/smoke-host.mjs     # 宿主半：窗口校验 + 三条数据源口径 + 凭据只读/降级（grant & ref）+ 缓存单飞 + 端点行为（期望 ALL PASSED）
 node --check client.js; node --check index.js
 ```
+
+> `smoke-client.mjs` 里的 `node --check` 用 `stdio: 'ignore'` 调子进程：受限环境（如文件沙箱）禁止子进程建管道，`stdio: 'pipe'` 会在启动阶段就以 `EPERM` 失败，与文件是否合法无关。
 
 真机清单（重启 + 硬刷新后）：
 
@@ -68,13 +123,22 @@ node --check client.js; node --check index.js
 6. 选择失败（会话被占用等）面板保持打开并显示错误；点外部 / `resize` / 页面 `scroll` 关闭级联，但**在弹层内滚动模型列表不关闭**（滚轮与拖动滚动条均可滚动长列表）；
 7. 悬停 title 显示 `显示名 (路由id)`；会话内切换模型/路由，徽标即时跟随；
 8. subagent 会话无徽标；空白会话（hero 态）无徽标；官方 `/model` 弹窗行为不变；
-9. 手动触发一次故障转移后徽标仍显示会话选择的路由（非目标确认）。
+9. 手动触发一次故障转移后徽标仍显示会话选择的路由（非目标确认）；
+10. **额度（Codex）**：当前会话路由为 `openai-codex` 时打开级联，该行右侧出现 `5h x% · 7d y%`，数值与 Codex 自身 `/status` 一致；悬停 title 含重置倒计时与套餐名；
+11. **额度（Kimi）**：`kimi-coding` 行右侧出现 `5h x% · 7d y%`（**不会**有三个窗口），悬停 title 除窗口外还有账单段 `本月已用 ¥0.00 · 月度上限 Unlimited · 加购余额 ¥32.77（钱包已停用 STATUS_DISABLED）`（数值随账号变化；`月度上限` 在未启用时是 `Unlimited`）；把该路由的 `apiKeyEnv` 临时指向一个不存在的引用后重开菜单，额度消失且无任何错误提示；
+12. **额度（OpenCode Go）**：`opencode-go` 行右侧出现 `5h x% · 7d y% · 30d z%` 三个窗口（比另两行宽），且 provider 列宽已放到 260px、显示名没被挤没；悬停 title 三个窗口各自带倒计时、无「套餐」段；数值与 [console](https://opencode.ai/console) 的用量一致；
+13. **额度降级**：未配置凭据（或令牌已过期）时不显示额度且**不出现任何错误提示**；打开一次浏览器 DevTools Network 面板，确认 `GET /provider-badge/quota` 在 25s 内重复开菜单时不再发第二次请求，且响应体里搜不到任何令牌片段。
+
 
 ## 实现备注
 
-- **cordis 注入权限模型（踩过一次的坑）**：插件 `exports.inject` 决定 apply 作用域能访问的服务树；本插件需 `["slots", "sessions", "modelDirectories", "remote", "remote.session"]` —— 缺 `remote`/`remote.session` 时 `modelDirectories.directoryFor()` 内部访问 `this.ctx.remote.session` 会抛 `cannot get property "remote.session" without inject`，且被降级路径吞掉表现为「无报错 + 无徽标」。先例：官方 model-selection 的 inject 同样声明 `remote`/`remote.session`。
-- 交付为手写 CJS + `window.__ModuleLoader__.load({id, factory})` 包装的 classic script（先例：`dsh-deepseek-keypool/client.js`）；**任何模块级 import/export 会炸掉整个 `/plugins` combo**，改动后必须跑 `node probe/smoke-client.mjs`。
-- 零 npm 依赖、零构建步骤；`require` 白名单仅 `react`。
+- **cordis 注入权限模型（踩过一次的坑）**：插件 `exports.inject` 决定 apply 作用域能访问的服务树；本插件需 `["slots", "sessions", "modelDirectories", "remote", "remote.session"]` —— 缺 `remote`/`remote.session` 时 `modelDirectories.directoryFor()` 内部访问 `this.ctx.remote.session` 会抛 `cannot get property "remote.session" without inject`，且被降级路径吞掉表现为「无报错 + 无徽标」。先例：官方 model-selection 的 inject 同样声明 `remote`/`remote.session`。宿主半不声明 `inject` 导出，改用 `ctx.inject(['webServer'], …)` 动态挂载（无 `webServer` 的 profile 自动跳过额度端点，其余能力不受影响）。
+- **provider 列宽 176 → 200 → 260**：额度文案常驻该行右侧，176px 下显示名只剩 60 余像素；接 OpenCode Go 的三窗口文案（`5h 6% · 7d 36% · 30d 59%`，约 25 字符）后 200px 也不够，故放到 260px。列宽在 `CASCADE_PROVIDER_WIDTH` 与 `cascadePositionFor` 的默认参数两处同值（探针 `smoke-client.mjs` 的 `PROVIDER_WIDTH` 是第三处，改一处要三处同改）；极窄视口仍走收窄分支（provider 最窄 132px）。行内 `name` span 同时补了 `minWidth: 0` + `flex: 1 1 auto`，长显示名会省略号让位而不是把额度挤出列宽。
+- **额度数据源表驱动（三家共用同一条路径）**：`QUOTA_SOURCES` 每项只声明 `auth`（`grant` 读凭据记录 / `ref` 读 settings 里该路由生效的 `apiKeyEnv`，可带回退引用名）、`url`、`headers(auth)`、`parse(payload, now)`；服务层只剩「解析凭据 → 一次 GET → 解析响应」三步，缓存 / 单飞 / 降级 / 端点全部与数据源无关，浏览器半按 `row.id` 命中整表且**不限窗口个数**。OpenCode Go 是这套设计的第一次「零客户端改动」验证：只加了表里一条 + 一个 `parse` 函数，`client.js` 唯一的改动是把列宽从 200 调到 260。
+- **额度渲染对用户不可见地降级**：`ok:false` 的条目一律不渲染（与「不报错不占位」同口径）；探针 `smoke-client.mjs` 用「按 `useState` 调用序号播种」的假 react 钩子（`renderComponent` + `stateSeeds`）把「级联已打开」这一交互态直接摆到渲染函数前面，因此级联渲染路径有真实断言而非只看源码形状；播种序号即组件内 `useState` 顺序，顺序一变该断言立即失败。
+- **Kimi 账单口径的证据来源**：`kimi.exe` 是 Node SEA，内嵌明文 JS。用 `rg -a` 抽出 `parseBoosterWallet` / `fixedPointToCents` / `buildExtraUsageSection` / `formatCurrencyParts` 后按它的换算与判据实现（`1e6` 定点、不足 1 分算 1 分、`type === 'BOOSTER'` 且 `amount > 0`、`enabled && 上限 > 0` 才算有上限）。这是本插件第一次「照抄上游客户端语义」，所以两处刻意不同都写进了注释与本文档：**（1）** 多带 `status` 供客户端标注停用；**（2）** 不把账单当窗口，只进悬停说明。
+- 交付为手写 CJS + `window.__ModuleLoader__.load({id, factory})` 包装的 classic script（先例：`dsh-deepseek-keypool/client.js`）；**任何模块级 import/export 会炸掉整个 `/plugins` combo**，改动后必须跑 `node probe/smoke-client.mjs`。宿主半是普通 ESM（`type: module`），可由 `probe/smoke-host.mjs` 直接 `import`。
+- 零 npm 依赖、零构建步骤；`require` 白名单仅 `react`。宿主半只用 Node 内建能力（`fetch` + `AbortSignal.timeout`）。
 - 当前席位/API 契约证据（宿主 0.2.0-rc.2）：`dsh-client-ui-conversation/lib/types/client/contract/slots.d.ts`（席位）、`dsh-client-ui-model-selection/lib/types/client/directory.d.ts`（共享目录）、`dsh-client-ui-model-selection/lib/client.js:1174-1183`（官方 selection payload）。
 - 过程与 OpenSpec 文档（`openspec/`、`build_output_index.md`）保留在本地工作区，不入库（见 `.gitignore`）。
 

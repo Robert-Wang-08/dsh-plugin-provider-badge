@@ -52,10 +52,12 @@ check('S9 require 白名单 = react', requires.length > 0 && requires.every((r) 
 
 for (const file of ['client.js', 'index.js']) {
   try {
-    execFileSync(process.execPath, ['--check', path.join(root, file)], { cwd: root, stdio: 'pipe' })
+    // stdio 用 'ignore' 而非 'pipe'：受限环境（如 DSH 文件沙箱）禁止子进程建管道，
+    // 'pipe' 会在启动阶段就以 EPERM 失败，与文件是否合法无关。
+    execFileSync(process.execPath, ['--check', path.join(root, file)], { cwd: root, stdio: 'ignore' })
     check(`S9 node --check ${file}`, true)
   } catch (e) {
-    check(`S9 node --check ${file}`, false, String(e.stderr || e.message))
+    check(`S9 node --check ${file}`, false, `exit ${e.status ?? '?'} ${e.code ?? ''}`.trim())
   }
 }
 
@@ -78,6 +80,13 @@ new vm.Script(source, { filename: 'client.js' }).runInContext(sandbox)
 check('S9 load 捕获到注册', captured !== null && captured.id === pkg.name)
 
 const hookIdentity = (fn) => fn
+/**
+ * useState 播种：按**调用序号**给某几次 useState 直接指定初值，用于渲染
+ * 「级联已打开」这类只有交互才能到达的状态（假 react 不重渲染）。
+ * 序号由 hookIndex 计数，每次渲染前由 renderComponent 归零。
+ */
+let hookIndex = 0
+const stateSeeds = new Map()
 const fakeReact = {
   createElement: (type, props, ...children) => ({ type, props: { ...props, children } }),
   useMemo: (fn) => fn(),
@@ -85,7 +94,9 @@ const fakeReact = {
   useRef: (init) => ({ current: init }),
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
   useState: (init) => {
-    const box = { value: typeof init === 'function' ? init() : init }
+    const index = hookIndex
+    hookIndex += 1
+    const box = { value: stateSeeds.has(index) ? stateSeeds.get(index) : (typeof init === 'function' ? init() : init) }
     const setter = (next) => { box.value = typeof next === 'function' ? next(box.value) : next }
     return [box.value, setter]
   },
@@ -105,7 +116,16 @@ const {
   badgeOf, faceOf, UNAVAILABLE,
   selectionFor, cascadePositionFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
   shouldCloseOnScroll,
+  QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,
+  formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaTitleOf, quotaToneOf,
+  formatMoney, extraUsageParts, CURRENCY_SYMBOLS,
 } = exports_.__test
+
+/** 组件渲染入口：每次渲染前把 useSub 序号归零，保证播种序号稳定。 */
+function renderComponent(props) {
+  hookIndex = 0
+  return registration !== null ? registration.component(props) : null
+}
 
 /* ── S4 v2：文本推导（4 字母：多词首字母，不足补尾字母，无符号） ───── */
 /* 以下标识符均为泛化示例，不含任何真实路由名。 */
@@ -312,7 +332,7 @@ const renderState = {
   groups: [{ id: 'provider-alpha', name: 'Alpha One' }],
 }
 const renderStore = { subscribe: () => () => {}, getSnapshot: () => renderState }
-const rendered = registration.component({ store: renderStore, load: () => {} })
+const rendered = renderComponent({ store: renderStore, load: () => {} })
 const childText = Array.isArray(rendered?.props?.children) ? rendered.props.children.join('') : rendered?.props?.children
 check('渲染：徽标 span + 4 字母文本 + title + 调色板底色 + 对比字色',
   rendered !== null && rendered.type === 'span'
@@ -323,8 +343,8 @@ check('渲染：徽标 span + 4 字母文本 + title + 调色板底色 + 对比�
   && rendered.props.style.color === inkFor(rendered.props.style.background)
   && rendered.props.style.fontWeight === 700
   && rendered.props.style.height === '16px')
-check('渲染：数据缺失 → null', registration.component(UNAVAILABLE) === null)
-check('渲染：store 快照为空 → null', registration.component({ store: { subscribe: () => () => {}, getSnapshot: () => ({ current: null }) } }) === null)
+check('渲染：数据缺失 → null', renderComponent(UNAVAILABLE) === null)
+check('渲染：store 快照为空 → null', renderComponent({ store: { subscribe: () => () => {}, getSnapshot: () => ({ current: null }) } }) === null)
 
 /* ── S5c：选色优先级与持久化（resolveColor / localStorage） ─────────── */
 
@@ -359,7 +379,7 @@ check('渲染：点击在无 DOM 环境不抛（面板保持关闭）', (() => {
   catch (e) { console.error(e); return false }
 })())
 fakeLS.store[STORAGE_KEY] = JSON.stringify({ 'provider-alpha': '#123456' })
-const renderedCovered = registration.component({ store: renderStore, load: () => {} })
+const renderedCovered = renderComponent({ store: renderStore, load: () => {} })
 const coveredChild = Array.isArray(renderedCovered?.props?.children) ? renderedCovered.props.children.join('') : renderedCovered?.props?.children
 check('渲染：localStorage 覆盖色优先于调色板',
   renderedCovered !== null && renderedCovered.type === 'span'
@@ -446,19 +466,23 @@ check('S8 selectionFor 无 reasoning 不带 effort 字段', (() => {
 })())
 
 const VP = { width: 800, height: 600 }
+// provider 列宽与 client.js 的 CASCADE_PROVIDER_WIDTH 同值：200 → 260
+// （三窗口额度文案 "5h 6% · 7d 36% · 30d 59%" 约 25 字符）。
+const PROVIDER_WIDTH = 260
+const MODEL_WIDTH = 236
 check('S8 cascade 正常：定位在锚点、模型列始终在 provider 右侧', (() => {
   const pos = cascadePositionFor({ left: 100, top: 300, bottom: 316 }, VP)
   const providerRight = pos.left + pos.providerWidth
   const modelLeft = providerRight + 6
   return pos.left === 100
-    && pos.providerWidth === 176 && pos.modelWidth === 236
-    && pos.totalWidth === 176 + 6 + 236
+    && pos.providerWidth === PROVIDER_WIDTH && pos.modelWidth === MODEL_WIDTH
+    && pos.totalWidth === PROVIDER_WIDTH + 6 + MODEL_WIDTH
     && modelLeft > providerRight && modelLeft + pos.modelWidth <= 800 - 8
 })())
 check('S8 cascade 右侧不足 → 整体左移（不翻左、列序不变）', (() => {
   const pos = cascadePositionFor({ left: 600, top: 300, bottom: 316 }, VP)
   return pos.left === 800 - 8 - pos.totalWidth
-    && pos.providerWidth === 176 && pos.modelWidth === 236
+    && pos.providerWidth === PROVIDER_WIDTH && pos.modelWidth === MODEL_WIDTH
     && pos.left + pos.providerWidth + 6 + pos.modelWidth <= 800 - 8
 })())
 check('S8 cascade 极窄视口 → provider 收窄、模型取剩余且仍在右侧', (() => {
@@ -478,11 +502,11 @@ check('S8 cascade 垂直：下方不足 → 翻到锚点上方', (() => {
 check('S8 cascade 缺 rect → 安全回退不抛、列宽默认', (() => {
   const pos = cascadePositionFor(null, VP)
   return typeof pos.left === 'number' && typeof pos.top === 'number'
-    && typeof pos.totalWidth === 'number' && pos.providerWidth === 176 && pos.modelWidth === 236
+    && typeof pos.totalWidth === 'number' && pos.providerWidth === PROVIDER_WIDTH && pos.modelWidth === MODEL_WIDTH
 })())
 check('S8 cascade 无视口 → 不抛且列宽默认', (() => {
   const pos = cascadePositionFor({ left: 10, top: 10, bottom: 26 }, undefined)
-  return pos.providerWidth === 176 && pos.modelWidth === 236 && pos.left === 10
+  return pos.providerWidth === PROVIDER_WIDTH && pos.modelWidth === MODEL_WIDTH && pos.left === 10
 })())
 
 const pRows = [
@@ -563,6 +587,325 @@ check('S8b 源码：面板仍为 maxHeight + overflowY auto', (() => {
   const m = source.match(/PANEL_BASE_STYLE\s*=\s*\{([\s\S]*?)\n\s*\};/)
   return m !== null && /maxHeight\s*:/.test(m[1]) && /overflowY\s*:\s*["']auto["']/.test(m[1])
 })())
+
+/* ── S10：OpenAI Codex 官方额度（宿主端点 → provider 行内文案） ────── */
+
+check('S10 端点路径与宿主半一致', QUOTA_ENDPOINT === '/provider-badge/quota')
+check('S10 客户端 TTL 短于宿主上游缓存窗口', QUOTA_CLIENT_TTL_MS > 0 && QUOTA_CLIENT_TTL_MS < 60000)
+
+check('S10 formatWindowSpan 按时长成标签（不按 primary/secondary 角色）',
+  formatWindowSpan(18000) === '5h' && formatWindowSpan(604800) === '7d'
+  && formatWindowSpan(3600) === '1h' && formatWindowSpan(1800) === '30m' && formatWindowSpan(90) === '90s')
+check('S10 formatWindowSpan 非法 → null', formatWindowSpan(0) === null && formatWindowSpan(-5) === null
+  && formatWindowSpan('18000') === null && formatWindowSpan(NaN) === null && formatWindowSpan(null) === null)
+check('S10 formatCountdown 短文案', formatCountdown(13363) === '3h42m' && formatCountdown(455917) === '5d6h'
+  && formatCountdown(59) === '1m' && formatCountdown(0) === '1m' && formatCountdown('x') === null)
+
+const quotaEntry = {
+  ok: true,
+  plan: 'plus',
+  limitReached: false,
+  credits: { hasCredits: false, unlimited: false, balance: '0' },
+  fetchedAt: 1792206238452,
+  windows: [
+    { windowSeconds: 604800, usedPercent: 35, resetsAt: 1792662162, resetAfterSeconds: 455917 },
+    { windowSeconds: 18000, usedPercent: 4, resetsAt: 1792219608, resetAfterSeconds: 13363 },
+  ],
+}
+
+check('S10 窗口按时长升序（乱序输入也 5h 在前）', (() => {
+  const labels = quotaWindowsOf(quotaEntry).map((w) => w.label)
+  return labels.length === 2 && labels[0] === '5h' && labels[1] === '7d'
+})())
+check('S10 quotaInlineTextOf 追加最紧窗口的重置倒计时', (() => {
+  const text = quotaInlineTextOf(quotaEntry)
+  return typeof text === 'string' && text.startsWith('5h 4% · 7d 35% · 重置 ')
+})())
+check('S10 quotaInlineTextOf 无重置字段时保持百分比文案', quotaInlineTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 4 }] }) === '5h 4%')
+check('S10 quotaInlineTextOf 只选最短剩余时间', quotaInlineTextOf({ ok: true, windows: [
+  { windowSeconds: 18000, usedPercent: 4, resetAfterSeconds: 7200 },
+  { windowSeconds: 604800, usedPercent: 35, resetAfterSeconds: 3600 },
+] }) === '5h 4% · 7d 35% · 重置 1h')
+check('S10 quotaTextOf 单窗口', quotaTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 4 }] }) === '5h 4%')
+check('S10 quotaTextOf 百分比取整', quotaTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 4.6 }] }) === '5h 5%')
+check('S10 不可用条目一律 null', quotaTextOf(null) === null && quotaTextOf({ ok: false, reason: 'token-expired' }) === null
+  && quotaTextOf({ ok: true, windows: [] }) === null && quotaTextOf({ ok: true }) === null)
+check('S10 缺字段窗口被丢弃（不编造百分比）', quotaTextOf({ ok: true, windows: [{ usedPercent: 4 }, { windowSeconds: 18000 }] }) === null)
+check('S10 百分比夹取 [0,100]', quotaTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 180 }] }) === '5h 100%'
+  && quotaTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: -2 }] }) === '5h 0%')
+check('S10 quotaToneOf 分级', quotaToneOf(quotaEntry) === 'normal'
+  && quotaToneOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 75 }] }) === 'warn'
+  && quotaToneOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 95 }] }) === 'danger'
+  && quotaToneOf({ ok: true, limitReached: true, windows: [{ windowSeconds: 18000, usedPercent: 1 }] }) === 'danger'
+  && quotaToneOf(null) === null && quotaToneOf({ ok: false }) === null)
+check('S10 只按最紧的窗口定级（两窗口互不掩盖）',
+  quotaToneOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 2 }, { windowSeconds: 604800, usedPercent: 99 }] }) === 'danger')
+check('S10 quotaTitleOf 含用量/倒计时/套餐', (() => {
+  const title = quotaTitleOf(quotaEntry)
+  return typeof title === 'string' && title.includes('5h 已用 4%') && title.includes('7d 已用 35%')
+    && title.includes('后重置') && title.includes('套餐 plus')
+})())
+check('S10 quotaTitleOf 有额外余额才提示余额', (() => {
+  const withCredits = quotaTitleOf({ ...quotaEntry, credits: { hasCredits: true, balance: '12.5' } })
+  return withCredits.includes('余额 12.5') && !quotaTitleOf(quotaEntry).includes('余额')
+})())
+check('S10 色调表：normal 不指定颜色（走继承）',
+  QUOTA_TONES.normal === null && typeof QUOTA_TONES.warn === 'string' && typeof QUOTA_TONES.danger === 'string')
+
+/* Kimi 型条目：无套餐名、无余额、只有绝对重置时刻、7 天窗口已用满。 */
+// 重置时刻统一留 30s 余量：倒计时按「Math.round(剩余秒数)」分桶，若正好落在
+// 整点边界（3600 - ε 会舍入成 3599 → "59m"）断言就会偶发失败。
+const nowSeconds = Math.floor(Date.now() / 1000)
+const kimiQuotaEntry = {
+  ok: true,
+  plan: null,
+  limitReached: true,
+  credits: null,
+  fetchedAt: 1,
+  windows: [
+    { windowSeconds: 604800, usedPercent: 100, resetsAt: nowSeconds + 5 * 86400 + 30, resetAfterSeconds: null },
+    { windowSeconds: 18000, usedPercent: 0, resetsAt: nowSeconds + 3600 + 30, resetAfterSeconds: null },
+  ],
+}
+
+check('S10 Kimi 型条目文案与 Codex 同形', quotaTextOf(kimiQuotaEntry) === '5h 0% · 7d 100%')
+check('S10 Kimi 型条目窗口按时长升序', quotaWindowsOf(kimiQuotaEntry).map((w) => w.label).join(',') === '5h,7d')
+check('S10 Kimi 型条目无套餐名时不出现「套餐」段', (() => {
+  const title = quotaTitleOf(kimiQuotaEntry)
+  return typeof title === 'string' && title.includes('5h 已用 0%') && title.includes('7d 已用 100%')
+    && !title.includes('套餐') && !title.includes('余额')
+})())
+check('S10 Kimi 型条目只有绝对时刻也能算倒计时', (() => {
+  const title = quotaTitleOf(kimiQuotaEntry)
+  return typeof title === 'string' && /1h后重置/.test(title) && /5d后重置/.test(title)
+})())
+check('S10 Kimi 型 limitReached → danger 色调（上限由宿主推导）', quotaToneOf(kimiQuotaEntry) === 'danger')
+
+/* OpenCode Go 型条目：三窗口（rolling/weekly/monthly → 5h/7d/30d），无套餐名无余额。 */
+const opencodeQuotaEntry = {
+  ok: true,
+  plan: null,
+  limitReached: false,
+  credits: null,
+  fetchedAt: 1,
+  windows: [
+    { windowSeconds: 2592000, usedPercent: 59, resetsAt: nowSeconds + 3 * 86400 + 30, resetAfterSeconds: null },
+    { windowSeconds: 18000, usedPercent: 6, resetsAt: nowSeconds + 3600 + 30, resetAfterSeconds: null },
+    { windowSeconds: 604800, usedPercent: 36, resetsAt: nowSeconds + 2 * 86400 + 30, resetAfterSeconds: null },
+  ],
+}
+
+check('S10 三窗口条目文案（客户端零改动即支持 5h · 7d · 30d）',
+  quotaTextOf(opencodeQuotaEntry) === '5h 6% · 7d 36% · 30d 59%')
+check('S10 三窗口按时长升序（乱序输入）', quotaWindowsOf(opencodeQuotaEntry).map((w) => w.label).join(',') === '5h,7d,30d')
+check('S10 三窗口按最紧的窗口定级（月度 95% → danger）', quotaToneOf({
+  ok: true,
+  windows: [
+    { windowSeconds: 18000, usedPercent: 6 },
+    { windowSeconds: 604800, usedPercent: 36 },
+    { windowSeconds: 2592000, usedPercent: 95 },
+  ],
+}) === 'danger')
+check('S10 三窗口悬停说明逐窗口带倒计时且无套餐段', (() => {
+  const title = quotaTitleOf(opencodeQuotaEntry)
+  return typeof title === 'string' && title.includes('5h 已用 6%') && title.includes('7d 已用 36%')
+    && title.includes('30d 已用 59%') && (title.match(/后重置/g) || []).length === 3
+    && !title.includes('套餐')
+})())
+check('S10 30 天窗口标签为 30d（不是 4w / 720h）', formatWindowSpan(2592000) === '30d')
+
+/* Kimi 账单口径（Extra Usage）：钱，只进悬停说明，不进徽标行文本。 */
+const kimiExtra = {
+  totalCents: 15000,
+  balanceCents: 3277,
+  monthlyUsedCents: 0,
+  monthlyChargeLimitCents: 0,
+  monthlyChargeLimitEnabled: false,
+  currency: 'CNY',
+  status: 'STATUS_DISABLED',
+}
+check('S10 formatMoney 常见币种与回退', formatMoney(3277, 'CNY') === '¥32.77' && formatMoney(0, 'USD') === '$0.00'
+  && formatMoney(1234, 'XYZ') === '12.34 XYZ' && formatMoney(1234, undefined) === '$12.34'
+  && formatMoney('12', 'CNY') === null && formatMoney(null, 'CNY') === null && formatMoney(NaN, 'CNY') === null)
+check('S10 extraUsageParts 三段（上限未启用 → Unlimited，且钱包停用被标注）', (() => {
+  const parts = extraUsageParts(kimiExtra)
+  return parts.length === 3 && parts[0] === '本月已用 ¥0.00' && parts[1] === '月度上限 Unlimited'
+    && parts[2] === '加购余额 ¥32.77（钱包已停用 STATUS_DISABLED）'
+})())
+check('S10 extraUsageParts 上限启用 → 显示金额；ACTIVE 不标注', (() => {
+  const parts = extraUsageParts({ ...kimiExtra, monthlyChargeLimitEnabled: true, monthlyChargeLimitCents: 5000, status: 'STATUS_ACTIVE' })
+  return parts.join(' · ') === '本月已用 ¥0.00 · 月度上限 ¥50.00 · 加购余额 ¥32.77'
+})())
+check('S10 extraUsageParts 未知状态原样标注', extraUsageParts({ ...kimiExtra, status: 'STATUS_FROZEN' })[2]
+  === '加购余额 ¥32.77（钱包状态 STATUS_FROZEN）')
+check('S10 extraUsageParts 缺字段 → 空数组（不显示空段）', extraUsageParts(null).length === 0
+  && extraUsageParts(undefined).length === 0 && extraUsageParts('x').length === 0)
+check('S10 extraUsageParts 缺 cents 时跳过对应段', (() => {
+  const parts = extraUsageParts({ currency: 'CNY', monthlyChargeLimitEnabled: false })
+  return parts.length === 1 && parts[0] === '月度上限 Unlimited'
+})())
+check('S10 Kimi 悬停说明追加账单段（徽标行文本不变）', (() => {
+  const withExtra = { ...kimiQuotaEntry, extraUsage: kimiExtra }
+  const title = quotaTitleOf(withExtra)
+  return title.includes('7d 已用 100%') && title.includes('本月已用 ¥0.00')
+    && title.includes('月度上限 Unlimited') && title.includes('加购余额 ¥32.77（钱包已停用 STATUS_DISABLED）')
+    && quotaTextOf(withExtra) === '5h 0% · 7d 100%'
+})())
+check('S10 无 extraUsage 时说明里不出现账单段（向后兼容）', !quotaTitleOf(kimiQuotaEntry).includes('本月已用'))
+check('S10 只有 extraUsage 没有窗口 → 仍不渲染（title null）',
+  quotaTitleOf({ ok: true, extraUsage: kimiExtra, windows: [] }) === null)
+check('S10 货币符号表覆盖常见币种', CURRENCY_SYMBOLS.CNY === '¥' && CURRENCY_SYMBOLS.USD === '$'
+  && CURRENCY_SYMBOLS.EUR === '€' && CURRENCY_SYMBOLS.GBP === '£')
+
+/* ── S10b：级联渲染（播种「级联已打开」+ 额度缓存命中） ─────────────── */
+
+const quotaRenderState = {
+  status: 'ready',
+  current: { provider: 'openai-codex', model: 'gpt-5.6-sol' },
+  groups: [
+    { id: 'openai-codex', name: 'OpenAI Codex (official)', models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }] },
+    { id: 'ais-2dsglm', name: 'AIS 2DSGLM', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] },
+  ],
+}
+const quotaRenderStore = { subscribe: () => () => {}, getSnapshot: () => quotaRenderState }
+const openCascadeSeed = () => ({
+  left: 0,
+  top: 0,
+  totalWidth: PROVIDER_WIDTH + 6 + MODEL_WIDTH,
+  providerWidth: PROVIDER_WIDTH,
+  modelWidth: MODEL_WIDTH,
+})
+/** 组件内 useState 调用序：0 overrides / 1 colorMode / 2 cascade / 3 activeProviderId /
+ *  4 focusLevel / 5 providerIndex / 6 modelIndex / 7 localError / 8 pendingSelection /
+ *  9 quotaRoutes。序号变化时下面的「播种生效」断言会直接失败。 */
+const CASCADE_HOOK_INDEX = 2
+const ACTIVE_PROVIDER_HOOK_INDEX = 3
+
+const panelsOf = (node) => {
+  if (node === null || node === undefined || node.props === undefined) return []
+  if (!Array.isArray(node.props.children)) return []
+  return node.props.children.filter((child) => child !== null && child !== undefined
+    && child.props !== undefined && child.props.role === 'listbox')
+}
+const rowsOfPanel = (panel) => {
+  if (panel === undefined || panel.props === undefined || !Array.isArray(panel.props.children)) return []
+  const first = panel.props.children[0]
+  return Array.isArray(first) ? first : []
+}
+const rowOfId = (rows, id) => rows.find((row) => row !== null && row !== undefined
+  && row.props !== undefined && row.props['data-provider-row'] === id)
+const quotaSpanOfRow = (row) => {
+  if (row === undefined || !Array.isArray(row.props.children)) return undefined
+  return row.props.children.find((child) => child !== null && child !== undefined
+    && child.props !== undefined && child.props['data-provider-badge-quota'] !== undefined)
+}
+/** 渲染一次「级联已打开」的组件，返回 provider 列的行数组。 */
+const renderOpenCascade = () => {
+  stateSeeds.set(CASCADE_HOOK_INDEX, openCascadeSeed())
+  const render = renderComponent({ store: quotaRenderStore, load: () => {} })
+  stateSeeds.clear()
+  const panels = panelsOf(Array.isArray(render) ? render[1] : null)
+  return { panels, rows: rowsOfPanel(panels[0]) }
+}
+
+quotaCache.routes = { 'openai-codex': quotaEntry }
+quotaCache.at = Date.now()
+stateSeeds.set(ACTIVE_PROVIDER_HOOK_INDEX, 'openai-codex')
+const openRender = renderOpenCascade()
+stateSeeds.clear()
+
+check('S10b 播种生效：级联打开且 provider/model 两列就位', openRender.panels.length === 2)
+check('S10b provider 列含两行 + 选色入口，额度状态按缓存就位',
+  openRender.rows.length === 3 && rowOfId(openRender.rows, 'openai-codex') !== undefined
+  && rowOfId(openRender.rows, 'ais-2dsglm') !== undefined)
+
+const codexRow = rowOfId(openRender.rows, 'openai-codex')
+const codexQuota = quotaSpanOfRow(codexRow)
+const quotaTextOfSpan = (span) => {
+  if (span === undefined || span.props === undefined) return null
+  const kids = span.props.children
+  return Array.isArray(kids) ? kids.join('') : kids
+}
+check('S10b openai-codex 行右侧渲染额度文案与重置倒计时', codexQuota !== undefined
+  && quotaTextOfSpan(codexQuota).startsWith('5h 4% · 7d 35% · 重置 '))
+check('S10b 额度字号小于行文本、不换行不参与收缩', codexQuota !== undefined
+  && codexQuota.props.style.fontSize === '10px' && codexQuota.props.style.whiteSpace === 'nowrap'
+  && codexQuota.props.style.flex === 'none' && codexQuota.props.style.marginLeft === '8px')
+check('S10b 额度悬停说明带重置与套餐', codexQuota !== undefined && typeof codexQuota.props.title === 'string'
+  && codexQuota.props.title.includes('7d 已用 35%') && codexQuota.props.title.includes('套餐 plus'))
+check('S10b 未报告额度的行不渲染额度', quotaSpanOfRow(rowOfId(openRender.rows, 'ais-2dsglm')) === undefined)
+check('S10b 额度 span 位于 name 之后、trailing 之前', (() => {
+  if (codexRow === undefined) return false
+  const kids = codexRow.props.children
+  if (!Array.isArray(kids)) return false
+  const nameIndex = kids.findIndex((c) => c !== null && c !== undefined && c.props !== undefined && c.props.key === 'name')
+  const quotaIndex = kids.findIndex((c) => c !== null && c !== undefined && c.props !== undefined && c.props.key === 'quota')
+  const symIndex = kids.findIndex((c) => c !== null && c !== undefined && c.props !== undefined && c.props.key === 'sym')
+  return nameIndex >= 0 && quotaIndex === nameIndex + 1 && symIndex === quotaIndex + 1
+})())
+check('S10b 名称列可压缩（minWidth 0 + flex + ellipsis）给额度让位', (() => {
+  if (codexRow === undefined) return false
+  const name = codexRow.props.children.find((c) => c !== null && c !== undefined && c.props !== undefined && c.props.key === 'name')
+  return name !== undefined && name.props.style.minWidth === 0
+    && name.props.style.flex === '1 1 auto' && name.props.style.textOverflow === 'ellipsis'
+})())
+
+check('S10b 危险用量走 danger 色调', (() => {
+  quotaCache.routes = { 'openai-codex': { ok: true, plan: 'plus', limitReached: false, windows: [{ windowSeconds: 18000, usedPercent: 97 }] } }
+  quotaCache.at = Date.now()
+  const { rows } = renderOpenCascade()
+  const span = quotaSpanOfRow(rowOfId(rows, 'openai-codex'))
+  return span !== undefined && span.props.style.color === QUOTA_TONES.danger && span.props.style.opacity === 1
+})())
+
+check('S10b 无额度缓存时不渲染任何额度 span', (() => {
+  quotaCache.routes = null
+  quotaCache.at = 0
+  const { rows } = renderOpenCascade()
+  return quotaSpanOfRow(rowOfId(rows, 'openai-codex')) === undefined
+})())
+
+check('S10b ok:false 条目不渲染（宿主降级对用户不可见）', (() => {
+  quotaCache.routes = { 'openai-codex': { ok: false, reason: 'token-expired' } }
+  quotaCache.at = Date.now()
+  const { rows } = renderOpenCascade()
+  return quotaSpanOfRow(rowOfId(rows, 'openai-codex')) === undefined
+})())
+
+check('S10b Kimi 行同样渲染（本半按行 id 命中，不认识具体 provider）', (() => {
+  quotaRenderState.groups.push({ id: 'kimi-coding', name: 'Kimi (official)', models: [{ id: 'kimi-k2', name: 'Kimi K2' }] })
+  quotaCache.routes = { 'openai-codex': quotaEntry, 'kimi-coding': kimiQuotaEntry }
+  quotaCache.at = Date.now()
+  const { rows } = renderOpenCascade()
+  const span = quotaSpanOfRow(rowOfId(rows, 'kimi-coding'))
+  const text = quotaTextOfSpan(span)
+  const title = span !== undefined ? span.props.title : null
+  quotaRenderState.groups.pop()
+  return rows.length === 4 && typeof text === 'string' && text.startsWith('5h 0% · 7d 100% · 重置 ')
+    && span !== undefined && span.props.style.color === QUOTA_TONES.danger
+    && typeof title === 'string' && title.includes('7d 已用 100%') && !title.includes('套餐')
+})())
+
+check('S10b OpenCode Go 行渲染三窗口（provider 列 260px）', (() => {
+  quotaRenderState.groups.push({ id: 'opencode-go', name: 'OpenCode Go', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] })
+  quotaCache.routes = { 'opencode-go': opencodeQuotaEntry }
+  quotaCache.at = Date.now()
+  const { rows } = renderOpenCascade()
+  const span = quotaSpanOfRow(rowOfId(rows, 'opencode-go'))
+  const text = quotaTextOfSpan(span)
+  quotaRenderState.groups.pop()
+  return rows.length === 4 && typeof text === 'string' && text.startsWith('5h 6% · 7d 36% · 30d 59% · 重置 ')
+    && span !== undefined && span.props.style.flex === 'none'
+    && typeof span.props.title === 'string' && span.props.title.includes('30d 已用 59%')
+})())
+
+quotaCache.routes = null
+quotaCache.at = 0
+
+check('S10b 源码：级联打开时才请求额度端点，且失败静默', /fetch\(\s*QUOTA_ENDPOINT/.test(source)
+  && /if \(!cascadeOpen\) return undefined;/.test(source))
+check('S10b 源码：额度不写 settings/不碰凭据（客户端半零凭据引用）',
+  !/credentials/.test(source) && !/localStorage\.setItem\(\s*["']dsh-plugin-provider-badge:quota/.test(source))
 
 /* ── 汇总 ─────────────────────────────────────────────────────────── */
 
