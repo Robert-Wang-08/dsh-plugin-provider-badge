@@ -48,7 +48,8 @@ check('S9 结尾形状（return module.exports; … });）', source.trimEnd().en
 check('S9 无 ESM import/export 语句', !/^\s*(import|export)\s/m.test(source))
 
 const requires = [...source.matchAll(/require\(\s*["']([^"']+)["']\s*\)/g)].map((m) => m[1])
-check('S9 require 白名单 = react', requires.length > 0 && requires.every((r) => r === 'react'), requires.join(', '))
+check('S9 require 白名单 = react + react-dom', requires.length > 0 && requires.every((r) => r === 'react' || r === 'react-dom'), requires.join(', '))
+check('S9 级联经 createPortal 挂载（缺失时内联降级）', source.includes('createPortal(cascadeEl, portalTarget)'))
 
 for (const file of ['client.js', 'index.js']) {
   try {
@@ -91,6 +92,7 @@ const fakeReact = {
   createElement: (type, props, ...children) => ({ type, props: { ...props, children } }),
   useMemo: (fn) => fn(),
   useEffect: hookIdentity,
+  useLayoutEffect: hookIdentity,
   useRef: (init) => ({ current: init }),
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
   useState: (init) => {
@@ -101,9 +103,13 @@ const fakeReact = {
     return [box.value, setter]
   },
 }
+// 假 react-dom：createPortal 原样返回子树。沙箱无 document，client.js 的
+// portal 分支不会走到这里；此桩只为 require 解析成功。
+const fakeReactDOM = { createPortal: (node) => node }
 const exports_ = captured.factory((name) => {
-  if (name !== 'react') throw new Error(`unexpected require: ${name}`)
-  return fakeReact
+  if (name === 'react') return fakeReact
+  if (name === 'react-dom') return fakeReactDOM
+  throw new Error(`unexpected require: ${name}`)
 })
 
 check('exports.inject 权限清单正确', JSON.stringify(exports_.inject) === JSON.stringify(['slots', 'sessions', 'modelDirectories', 'remote', 'remote.session']))
@@ -114,10 +120,10 @@ const {
   parseColor, relativeLuminance, inkFor, wheelDist, hueSlotsFor, routeIdsOf,
   resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
   badgeOf, faceOf, UNAVAILABLE,
-  selectionFor, cascadePositionFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
+  selectionFor, cascadePlacementFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
   shouldCloseOnScroll,
   QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,
-  formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaTitleOf, quotaToneOf,
+  formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaFailureOf, quotaTitleOf, quotaToneOf,
   formatMoney, extraUsageParts, CURRENCY_SYMBOLS,
 } = exports_.__test
 
@@ -441,7 +447,7 @@ check('S5e 未入表未知路由仍自动推导', (() => {
 })())
 check('S5e 覆盖不改变悬停 title', badgeOf(labelState('codex-relay', 'Codex Relay')).title === 'Codex Relay (codex-relay)')
 
-/* ── S8：级联模型选择门禁（selectionFor / cascadePositionFor / ─────────── */
+/* ── S8：级联模型选择门禁（selectionFor / cascadePlacementFor / ────────── */
 /*        providerIndexByPrefix / providerRowsOf / faceOf.select）           */
 
 const groupX = { id: 'provider-alpha', name: 'Alpha One' }
@@ -465,48 +471,79 @@ check('S8 selectionFor 无 reasoning 不带 effort 字段', (() => {
   return !('reasoningEffort' in sel) && sel.provider === 'provider-alpha' && sel.model === 'model-plain'
 })())
 
-const VP = { width: 800, height: 600 }
+const VP = { width: 800, height: 600, clientWidth: 800 }
 // provider 列宽与 client.js 的 CASCADE_PROVIDER_WIDTH 同值：200 → 260
 // （三窗口额度文案 "5h 6% · 7d 36% · 30d 59%" 约 25 字符）。
 const PROVIDER_WIDTH = 260
 const MODEL_WIDTH = 236
-check('S8 cascade 正常：定位在锚点、模型列始终在 provider 右侧', (() => {
-  const pos = cascadePositionFor({ left: 100, top: 300, bottom: 316 }, VP)
+check('S8 cascade 右侧充足：模型列在 provider 右侧、贴锚点', (() => {
+  const pos = cascadePlacementFor({ left: 100, right: 160, top: 300, bottom: 316 }, VP)
   const providerRight = pos.left + pos.providerWidth
   const modelLeft = providerRight + 6
-  return pos.left === 100
+  return pos.left === 100 && pos.flipped === false
     && pos.providerWidth === PROVIDER_WIDTH && pos.modelWidth === MODEL_WIDTH
     && pos.totalWidth === PROVIDER_WIDTH + 6 + MODEL_WIDTH
     && modelLeft > providerRight && modelLeft + pos.modelWidth <= 800 - 8
 })())
-check('S8 cascade 右侧不足 → 整体左移（不翻左、列序不变）', (() => {
-  const pos = cascadePositionFor({ left: 600, top: 300, bottom: 316 }, VP)
-  return pos.left === 800 - 8 - pos.totalWidth
+check('S8 cascade 右侧不足、左侧足 → 模型列翻转到 provider 左侧（C-3）', (() => {
+  const pos = cascadePlacementFor({ left: 600, right: 660, top: 300, bottom: 316 }, VP)
+  // 翻转：容器右缘对齐徽标右缘 660，渲染序 [模型][provider]（row-reverse）。
+  return pos.flipped === true
+    && pos.left === 660 - pos.totalWidth
     && pos.providerWidth === PROVIDER_WIDTH && pos.modelWidth === MODEL_WIDTH
-    && pos.left + pos.providerWidth + 6 + pos.modelWidth <= 800 - 8
+    && pos.left + pos.totalWidth === 660
+    && pos.left + pos.totalWidth <= 800 - 8
 })())
-check('S8 cascade 极窄视口 → provider 收窄、模型取剩余且仍在右侧', (() => {
-  const pos = cascadePositionFor({ left: 0, top: 300, bottom: 316 }, { width: 260, height: 600 })
+check('S8 cascade clientWidth 口径：clamp 用滚动条内宽度，右缘不探入滚动条', (() => {
+  // innerWidth 800、clientWidth 783（竖向滚动条 17px）、徽标右缘 790：
+  // 翻转 clamp 后右缘必须 = 783-8，而旧 innerWidth 口径会算出 790。
+  const pos = cascadePlacementFor({ left: 600, right: 790, top: 300, bottom: 316 }, { width: 800, height: 600, clientWidth: 783 })
+  return pos.flipped === true
+    && pos.left === 783 - 8 - pos.totalWidth
+    && pos.left + pos.totalWidth <= 783 - 8
+})())
+check('S8 cascade 两侧都放不下：不翻转、整体左移收窄夹取', (() => {
+  const pos = cascadePlacementFor({ left: 100, right: 460, top: 300, bottom: 316 }, { width: 500, height: 600, clientWidth: 500 })
+  return pos.flipped === false && pos.left === 8
+    && pos.totalWidth <= 500 - 8 - 8 + 1e-9
+    && pos.providerWidth + 6 + pos.modelWidth === pos.totalWidth
+})())
+check('S8 cascade 极窄视口 → provider 收窄到下限、模型取剩余', (() => {
+  const pos = cascadePlacementFor({ left: 0, right: 60, top: 300, bottom: 316 }, { width: 260, height: 600, clientWidth: 260 })
   return pos.left === 8
     && pos.providerWidth >= 132
     && pos.modelWidth >= 0
     && pos.totalWidth <= 260 - 8 - 8 + 1e-9
     && pos.providerWidth + 6 + pos.modelWidth === pos.totalWidth
 })())
+check('S8 cascade 单列（色板/无模型）：不翻转且 modelWidth 为 0', (() => {
+  const pos = cascadePlacementFor({ left: 600, right: 660, top: 300, bottom: 316 }, VP, PROVIDER_WIDTH, 0, 6, 340)
+  return pos.flipped === false && pos.modelWidth === 0 && pos.totalWidth === PROVIDER_WIDTH
+    && pos.left >= 8 && pos.left + pos.totalWidth <= 800 - 8
+})())
 check('S8 cascade 垂直：下方空间足 → 锚点下方', (() => {
-  return cascadePositionFor({ left: 100, top: 40, bottom: 56 }, VP).top === 62
+  return cascadePlacementFor({ left: 100, top: 40, bottom: 56 }, VP).top === 62
 })())
 check('S8 cascade 垂直：下方不足 → 翻到锚点上方', (() => {
-  return cascadePositionFor({ left: 100, top: 560, bottom: 576 }, VP).top === 560 - 6 - 340
+  return cascadePlacementFor({ left: 100, top: 560, bottom: 576 }, VP).top === 560 - 6 - 340
 })())
 check('S8 cascade 缺 rect → 安全回退不抛、列宽默认', (() => {
-  const pos = cascadePositionFor(null, VP)
+  const pos = cascadePlacementFor(null, VP)
   return typeof pos.left === 'number' && typeof pos.top === 'number'
     && typeof pos.totalWidth === 'number' && pos.providerWidth === PROVIDER_WIDTH && pos.modelWidth === MODEL_WIDTH
 })())
 check('S8 cascade 无视口 → 不抛且列宽默认', (() => {
-  const pos = cascadePositionFor({ left: 10, top: 10, bottom: 26 }, undefined)
+  const pos = cascadePlacementFor({ left: 10, top: 10, bottom: 26 }, undefined)
   return pos.providerWidth === PROVIDER_WIDTH && pos.modelWidth === MODEL_WIDTH && pos.left === 10
+})())
+check('S8 cascade 视口过矮 → 预留高度收缩到视口内（超长列表尾部可达）', (() => {
+  const pos = cascadePlacementFor({ left: 100, right: 160, top: 300, bottom: 316 }, { width: 800, height: 300, clientWidth: 800 })
+  return pos.panelMaxHeight === 300 - 16
+    && pos.top >= 8 && pos.top + pos.panelMaxHeight <= 300 - 8
+})())
+check('S8 cascade 正常视口 → 预留高度保持 340 上限', (() => {
+  const pos = cascadePlacementFor({ left: 100, right: 160, top: 300, bottom: 316 }, VP)
+  return pos.panelMaxHeight === 340
 })())
 
 const pRows = [
@@ -628,8 +665,13 @@ check('S10 quotaInlineTextOf 只选最短剩余时间', quotaInlineTextOf({ ok: 
 ] }) === '5h 4% · 7d 35% · 重置 1h')
 check('S10 quotaTextOf 单窗口', quotaTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 4 }] }) === '5h 4%')
 check('S10 quotaTextOf 百分比取整', quotaTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 4.6 }] }) === '5h 5%')
-check('S10 不可用条目一律 null', quotaTextOf(null) === null && quotaTextOf({ ok: false, reason: 'token-expired' }) === null
+check('S10 不可用条目不伪造百分比', quotaTextOf(null) === null && quotaTextOf({ ok: false, reason: 'token-expired' }) === null
   && quotaTextOf({ ok: true, windows: [] }) === null && quotaTextOf({ ok: true }) === null)
+check('S10 认证失败给出重新登录提示', quotaFailureOf({ ok: false, reason: 'http-401' }).text === '额度需登录'
+  && quotaFailureOf({ ok: false, reason: 'token-expired' }).title.includes('重新登录'))
+check('S10 未配置和其它失败给出脱敏状态', quotaFailureOf({ ok: false, reason: 'not-configured' }).text === '额度未配置'
+  && quotaFailureOf({ ok: false, reason: 'network', message: 'secret detail' }).title === '额度服务暂时不可用'
+  && quotaFailureOf({ ok: true }) === null)
 check('S10 缺字段窗口被丢弃（不编造百分比）', quotaTextOf({ ok: true, windows: [{ usedPercent: 4 }, { windowSeconds: 18000 }] }) === null)
 check('S10 百分比夹取 [0,100]', quotaTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: 180 }] }) === '5h 100%'
   && quotaTextOf({ ok: true, windows: [{ windowSeconds: 18000, usedPercent: -2 }] }) === '5h 0%')
@@ -865,11 +907,13 @@ check('S10b 无额度缓存时不渲染任何额度 span', (() => {
   return quotaSpanOfRow(rowOfId(rows, 'openai-codex')) === undefined
 })())
 
-check('S10b ok:false 条目不渲染（宿主降级对用户不可见）', (() => {
+check('S10b ok:false 认证失败保留可操作状态', (() => {
   quotaCache.routes = { 'openai-codex': { ok: false, reason: 'token-expired' } }
   quotaCache.at = Date.now()
   const { rows } = renderOpenCascade()
-  return quotaSpanOfRow(rowOfId(rows, 'openai-codex')) === undefined
+  const span = quotaSpanOfRow(rowOfId(rows, 'openai-codex'))
+  return span !== undefined && quotaTextOfSpan(span) === '额度需登录'
+    && span.props.title.includes('重新登录') && span.props.style.color === QUOTA_TONES.warn
 })())
 
 check('S10b Kimi 行同样渲染（本半按行 id 命中，不认识具体 provider）', (() => {
@@ -902,7 +946,7 @@ check('S10b OpenCode Go 行渲染三窗口（provider 列 260px）', (() => {
 quotaCache.routes = null
 quotaCache.at = 0
 
-check('S10b 源码：级联打开时才请求额度端点，且失败静默', /fetch\(\s*QUOTA_ENDPOINT/.test(source)
+check('S10b 源码：级联打开时才请求额度端点，端点整体不可达时静默', /fetch\(\s*QUOTA_ENDPOINT/.test(source)
   && /if \(!cascadeOpen\) return undefined;/.test(source))
 check('S10b 源码：额度不写 settings/不碰凭据（客户端半零凭据引用）',
   !/credentials/.test(source) && !/localStorage\.setItem\(\s*["']dsh-plugin-provider-badge:quota/.test(source))

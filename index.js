@@ -19,12 +19,12 @@
  *    `LLMKEY_KIMI` 即可回 200），回退到 `KIMI_API_KEY`。
  *    Kimi CLI 自己的 `~/.kimi-code/credentials/kimi-code.json` 不参与：那份
  *    OAuth 令牌实测 401，且刷新它就会与 Kimi CLI 抢同一份 refresh token。
- *  - `opencode-go`：`https://opencode.ai/inference/go/v1/usage`（OpenCode Go /
- *    Go Plus 订阅。别名 `/zen/go/v1/usage` 实测同源同响应；`/inference/go/...`
- *    取自官方文档的端点族，故用前者）。凭据同样取该路由生效的 `apiKeyEnv`
- *    引用（本机 `OPENCODE_API_KEY`），回退 `OPENCODE_API_KEY`。
- *    响应只有订阅级三个窗口（rolling/weekly/monthly）的百分比，**不按模型拆**；
- *    窗口时长按官方文档的 5 小时 = 月度 20%、每周 = 50%、每月 = 100% 口径映射。
+ *  - `opencode-go`：`https://opencode.ai/zen/go/v1/usage`（OpenCode Go /
+ *    Go Plus 订阅；当前 OpenCode CLI 同样从模型 API URL 推导该路径）。凭据取该
+ *    路由生效的 `apiKeyEnv` 引用（本机 `OPENCODE_API_KEY`），并回退同名引用。
+ *    解析同时兼容旧 `{usage:{rolling,weekly,monthly}}` 与当前
+ *    `{plan,windows:[{name,usagePercent,resetInSec}]}`；两者都只返回订阅级窗口，
+ *    不按模型拆。窗口时长仍按 5 小时 / 每周 / 每月（30 天）映射。
  *    该端点在官方 Console API 文档里**未列出**（文档只让去 console 网页看用量），
  *    属于「实测存在但未公开」，故同样纳入静默降级。
  *
@@ -38,8 +38,8 @@
  *  - 上游非 200 时只回状态码，不回响应体（错误页/错误体可能带账号信息）。
  *  - 响应有固定缓存窗口，避免每开一次菜单就打一次上游。
  *
- * 失败一律降级为 `{ok:false, reason}`：额度是锦上添花，任何一环不可用都不
- * 影响模型选择流程（浏览器半对 `ok:false` 不渲染任何东西）。
+ * 失败一律降级为 `{ok:false, reason}`：额度失败不影响模型选择流程，浏览器半
+ * 只把归一化 reason 显示为固定脱敏短状态，不透传上游错误体。
  */
 
 export const name = 'provider-badge'
@@ -77,7 +77,7 @@ const QUOTA_SOURCES = Object.freeze({
   }),
   'opencode-go': Object.freeze({
     auth: Object.freeze({ kind: 'ref', fallbackRefs: Object.freeze(['OPENCODE_API_KEY']) }),
-    url: 'https://opencode.ai/inference/go/v1/usage',
+    url: 'https://opencode.ai/zen/go/v1/usage',
     headers: () => ({}),
     parse: opencodeEntryFromPayload,
   }),
@@ -422,41 +422,60 @@ function kimiEntryFromPayload(payload, nowMs) {
 
 /**
  * OpenCode Go `/usage` 响应体 → 浏览器半消费的条目。
- * 响应形如 `{usage:{rolling:{status,percent,resetsAt},weekly:{...},monthly:{...}}}`：
- * 只有订阅级百分比，不按模型拆，也不带窗口时长（时长按官方文档口径映射）。
- * 只认 `OPENCODE_WINDOW_SECONDS` 里声明的三个键；`percent` 缺失即丢弃该窗口。
- * 已知局限：`status` 实测只有 `"ok"`，非 ok 的取值**未经验证**——这里按「非 ok
- * 即视为已达上限」处理（与 `percent >= 100` 同为红色判据）。上游不给套餐名
- * （Go 与 Go Plus 不可区分），故 `plan` 恒为 null。
+ * 兼容旧 `{usage:{rolling:{status,percent,resetsAt},...}}` 与当前
+ * `{plan,windows:[{name,status,usagePercent,resetInSec}]}`。两种结构都只有订阅级
+ * 百分比，不按模型拆，也不直接给标准窗口秒数，因此统一映射到 5h / 7d / 30d。
+ * 未知窗口名与缺失百分比的窗口会被忽略；非 ok 状态视为已达上限。
  * @param payload - `/usage` 的 JSON。
  * @param nowMs - 取值时刻（写进 fetchedAt）。
  * @returns 条目或 null。
  */
 function opencodeEntryFromPayload(payload, nowMs) {
   if (payload === null || typeof payload !== 'object') return null
-  const usage = payload.usage
-  if (usage === null || typeof usage !== 'object' || Array.isArray(usage)) return null
+
+  const candidates = []
+  const legacy = payload.usage
+  if (legacy !== null && typeof legacy === 'object' && Array.isArray(legacy) !== true) {
+    for (const key of Object.keys(OPENCODE_WINDOW_SECONDS)) {
+      const raw = legacy[key]
+      if (raw !== null && typeof raw === 'object') candidates.push({ key, raw, legacy: true })
+    }
+  }
+  if (Array.isArray(payload.windows)) {
+    for (const raw of payload.windows) {
+      if (raw === null || typeof raw !== 'object') continue
+      const name = strOrNull(raw.name)?.toLowerCase() ?? ''
+      const key = name.includes('month') ? 'monthly'
+        : name.includes('week') ? 'weekly'
+          : (name.includes('rolling') || name.includes('hour')) ? 'rolling' : null
+      if (key !== null) candidates.push({ key, raw, legacy: false })
+    }
+  }
+
   const windows = []
   let statusLimited = false
-  for (const key of Object.keys(OPENCODE_WINDOW_SECONDS)) {
-    const raw = usage[key]
-    if (raw === null || typeof raw !== 'object') continue
-    const percent = looseNum(raw.percent)
+  const seen = new Set()
+  for (const candidate of candidates) {
+    if (seen.has(candidate.key)) continue
+    const raw = candidate.raw
+    const percent = looseNum(candidate.legacy ? raw.percent : raw.usagePercent)
     if (percent === null) continue
+    seen.add(candidate.key)
     const status = strOrNull(raw.status)
     if (status !== null && status !== 'ok') statusLimited = true
+    const resetInSec = candidate.legacy ? null : looseNum(raw.resetInSec)
     windows.push({
-      windowSeconds: OPENCODE_WINDOW_SECONDS[key],
+      windowSeconds: OPENCODE_WINDOW_SECONDS[candidate.key],
       usedPercent: clampPercent(percent),
-      resetsAt: epochSecondsOf(raw.resetsAt),
-      resetAfterSeconds: null,
+      resetsAt: candidate.legacy ? epochSecondsOf(raw.resetsAt) : null,
+      resetAfterSeconds: resetInSec !== null && resetInSec >= 0 ? resetInSec : null,
     })
   }
   if (windows.length === 0) return null
   windows.sort((a, b) => a.windowSeconds - b.windowSeconds)
   return {
     ok: true,
-    plan: null,
+    plan: strOrNull(payload.plan),
     limitReached: statusLimited || windows.some((window) => window.usedPercent >= MAX_PERCENT),
     windows,
     credits: null,

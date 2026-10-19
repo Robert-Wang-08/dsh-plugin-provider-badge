@@ -2,3 +2,6 @@ node_modules/
 openspec/
 build_output_index.md
 *.log
+# 就地改动前的本机副本，按惯例命名；不进仓库
+*.bak
+*.bak-before-*

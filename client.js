@@ -20,12 +20,17 @@
  * - 数据：官方共享目录 store（ctx.modelDirectories），useSyncExternalStore
  *   订阅，会话切换模型/路由即时跟随；仅 status==="idle" 时触发一次官方
  *   load()（官方自带去重）。
- * - 级联：点徽标（或 Enter/Space/方向键）打开两级向右级联菜单：一级只列
- *   provider（成功行 + 失败 disabled 行），悬停/首字母选中 provider 后右侧
- *   二级列该 provider 的模型（模型列**始终在右侧**，右侧空间不足整体左移并
- *   收窄，不翻左）。选择复用同一 ModelDirectory.select（官方同口径
- *   selectionOf），失败保持菜单并显示 localError。官方 /model 弹窗与
- *   composer 模型席位零改变。
+ * - 级联：点徽标（或 Enter/Space/方向键）打开两级级联菜单：一级只列
+ *   provider（成功行 + 失败 disabled 行），悬停/首字母选中 provider 后
+ *   二级列该 provider 的模型（模型列默认在右侧；徽标贴近右缘、右侧放不下
+ *   完整两列而左侧放得下时**翻转到 provider 左侧**，见 cascadePlacementFor；
+ *   两侧都放不下时整体左移并收窄）。弹层经 react-dom createPortal 挂
+ *   document.body（脱离 composer 子树，规避祖先 transform/overflow 劫持
+ *   position:fixed 包含块；宿主缺 react-dom 时内联渲染降级），定位只在打开
+ *   时按常量预留计算一次（垂直 340 上限、水平两列总宽 + clientWidth），
+ *   打开后不再重排——悬停引起的高度变化不搬动弹层，避免抖动回路。选择复用
+ *   同一 ModelDirectory.select（官方同口径 selectionOf），失败保持菜单并
+ *   显示 localError。官方 /model 弹窗与 composer 模型席位零改变。
  * - 降级：modelDirectories 未装载 / directoryFor 抛错 / subagent 转址会话 /
  *   无当前选择 → 渲染 null，不报错不占位。
  *
@@ -51,6 +56,16 @@ window.__ModuleLoader__.load({
     const useEffect = react.useEffect;
     const useState = react.useState;
     const useRef = react.useRef;
+    // portal 载体：加载器静态模块表含 react-dom（dsh-web-frontend staticModules
+    // 的 require 白名单里有 "react-dom"）。缺失或异常时 cascade 内联渲染降级
+    // （行为同旧版，接受祖先 transform/overflow 劫持 fixed 包含块的风险）。
+    let createPortal = null;
+    try {
+      const reactDom = require("react-dom");
+      if (reactDom !== null && typeof reactDom === "object" && typeof reactDom.createPortal === "function") {
+        createPortal = reactDom.createPortal;
+      }
+    } catch (_) { /* 老 host：无 react-dom → 降级内联渲染 */ }
 
     /* ── 纯函数：文本与颜色推导（S4/S5 v2，probe 直接断言） ───────────── */
 
@@ -200,6 +215,25 @@ window.__ModuleLoader__.load({
       const windows = quotaWindowsOf(entry);
       if (windows.length === 0) return null;
       return windows.map((w) => w.label + " " + Math.round(w.usedPercent) + "%").join(" · ");
+    }
+
+    /**
+     * 不可用条目 → 用户可操作的短状态。服务端只回归一化 reason，不带上游响应体，
+     * 因此这里不会把令牌或账号信息带进界面。
+     */
+    function quotaFailureOf(entry) {
+      if (entry === null || typeof entry !== "object" || entry.ok !== false) return null;
+      const reason = typeof entry.reason === "string" ? entry.reason : "";
+      if (reason === "http-401" || reason === "token-expired") {
+        return { text: "额度需登录", title: "额度凭据已失效，请重新登录对应 provider" };
+      }
+      if (reason === "not-configured") {
+        return { text: "额度未配置", title: "未找到该 provider 的额度凭据" };
+      }
+      if (reason === "http-403") {
+        return { text: "额度不可用", title: "凭据无权读取当前套餐额度" };
+      }
+      return { text: "额度不可用", title: "额度服务暂时不可用" };
     }
 
     /**
@@ -569,37 +603,53 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 级联菜单定位（spec §3/§7）：providerWidth 260、modelWidth 236、gap 6、
-     * panelHeight 340、视口边距 8。
-     * 模型列**始终位于 provider 右侧**（列顺序不翻转）：水平按两列总宽定位，
-     * 右侧空间不足时整体容器左移；仍不足则按视口宽度收窄（provider 最窄约
-     * 132px、model 取剩余宽度并在 CSS 端 ellipsis），最终整体夹取在视口 8px
-     * 边距内。绝不返回左侧模型列（不翻左）。
+     * 级联菜单定位（含右缘翻转判定）。**只在打开时调用一次**——面板高度有
+     * maxHeight 上限、列宽是固定值，所以常量预留（垂直 340、水平两列总宽）
+     * 就是最坏情况的精确预算；打开后不按实测尺寸重排，避免悬停切换 provider
+     * 时高度变化回搬弹层、与静止光标下的 mouseenter 形成抖动回路。
+     * providerWidth 260、modelWidth 236、gap 6、panelHeight 340、视口边距 8。
+     * 模型列默认位于 provider 右侧（列顺序不翻转）；徽标右缘空间放不下完整
+     * 两列、且左侧放得下时，模型列**翻转到 provider 左侧**（容器
+     * flexDirection: row-reverse，容器右缘对齐徽标右缘，键盘 ArrowLeft/
+     * ArrowRight 语义随 flipped 取反）。两侧都放不下时回到右侧并按视口
+     * 收窄（provider 最窄约 132px、model 取剩余宽度并在 CSS 端 ellipsis）。
+     * 水平 clamp 一律用 viewport.clientWidth（排除竖向滚动条宽度）——
+     * window.innerWidth 含滚动条，直接用会把面板右缘推进滚动条带。
      * 垂直：优先锚点上方（composer 多在底部），上方不足才下方，最终 clamp。
-     * 默认列宽与 CASCADE_PROVIDER_WIDTH / CASCADE_MODEL_WIDTH 同值（一处改名两处改）。
-     * @param anchor - 徽标视口矩形（至少 left/top/bottom），缺失时安全回退 0。
-     * @param viewport - { width, height }，缺失/非法时按 0 处理。
-     * @returns { left, top, totalWidth, providerWidth, modelWidth }：整个级联
-     *   容器（两列并排）的 fixed 原点与各列宽度。
+     * @param anchor - 徽标视口矩形（至少 left/top/bottom；right 用于翻转
+     *   判定，缺失按退化锚点处理、不翻转）。
+     * @param viewport - { width, height, clientWidth }；clientWidth 缺失回退
+     *   width，整对象缺失/非法时按 0 处理。
+     * @param providerWidth - provider 列宽度。
+     * @param modelWidth - 模型列宽度；色板视图等单列场景传 0。
+     * @param gap - 两列间距。
+     * @param panelHeight - 面板总高（常量预留）。
+     * @returns { left, top, totalWidth, providerWidth, modelWidth, flipped,
+     *   panelMaxHeight }：整个级联容器（两列并排）的 fixed 原点、各列宽度、
+     *   翻转标记与面板 maxHeight（视口过矮时收缩，供面板样式使用）。
      */
-    function cascadePositionFor(anchor, viewport, providerWidth, modelWidth, gap, panelHeight) {
+    function cascadePlacementFor(anchor, viewport, providerWidth, modelWidth, gap, panelHeight) {
       const w1 = typeof providerWidth === "number" ? providerWidth : 260;
       const w2 = typeof modelWidth === "number" ? modelWidth : 236;
       const g = typeof gap === "number" ? gap : 6;
-      const ph = typeof panelHeight === "number" ? panelHeight : 340;
       const margin = 8;
-      const leftAnchor = anchor !== null && typeof anchor === "object" && typeof anchor.left === "number"
-        ? anchor.left : 0;
-      const topAnchor = anchor !== null && typeof anchor === "object" && typeof anchor.top === "number"
-        ? anchor.top : 0;
-      const bottomAnchor = anchor !== null && typeof anchor === "object" && typeof anchor.bottom === "number"
-        ? anchor.bottom : topAnchor;
-      const width = viewport !== null && typeof viewport === "object" && typeof viewport.width === "number"
-        ? viewport.width : 0;
-      const height = viewport !== null && typeof viewport === "object" && typeof viewport.height === "number"
-        ? viewport.height : 0;
+      const a = anchor !== null && typeof anchor === "object" ? anchor : {};
+      const leftAnchor = typeof a.left === "number" ? a.left : 0;
+      const topAnchor = typeof a.top === "number" ? a.top : 0;
+      const bottomAnchor = typeof a.bottom === "number" ? a.bottom : topAnchor;
+      const rightAnchor = typeof a.right === "number" ? a.right : leftAnchor;
+      const v = viewport !== null && typeof viewport === "object" ? viewport : {};
+      const height = typeof v.height === "number" ? v.height : 0;
+      const innerWidth = typeof v.width === "number" ? v.width : 0;
+      const clientW = typeof v.clientWidth === "number" && v.clientWidth > 0 ? v.clientWidth : innerWidth;
 
-      // 垂直：优先上方，其次下方，最后夹取。
+      // 视口过矮时收缩预留高度（返回 panelMaxHeight 供面板样式使用）：保证
+      // 面板（含内部滚动条）完整落在视口内，超长列表的尾部与滚动条不会坠出
+      // 视口外不可达。120px 下限防止极端矮视口下面板完全不可用。
+      const phRaw = typeof panelHeight === "number" ? panelHeight : 340;
+      const ph = height > 0 ? Math.max(120, Math.min(phRaw, height - margin * 2)) : phRaw;
+
+      // 垂直：优先上方，其次下方，最后夹取（垂直语义与旧版一致）。
       const above = topAnchor - g - ph;
       const below = bottomAnchor + g;
       let top;
@@ -613,24 +663,42 @@ window.__ModuleLoader__.load({
         top = above;
       }
 
-      // 水平：两列总宽。右侧不足整体左移；仍不足按视口收窄（模型列仍在右）。
+      // 水平：极窄视口先收窄两列（provider 下限 132，模型取剩余）。
       let pw = w1;
       let mw = w2;
-      if (width > 0 && pw + g + mw > width - margin * 2) {
-        const available = width - margin * 2;
+      if (clientW > 0 && pw + g + mw > clientW - margin * 2) {
+        const available = clientW - margin * 2;
         pw = Math.max(0, Math.min(w1, Math.max(132, available - g - mw)));
         mw = Math.max(0, Math.min(w2, available - g - pw));
       }
-      const totalWidth = pw + g + mw;
+      const totalWidth = mw > 0 ? pw + g + mw : pw;
+
+      // 翻转判定：右侧放不下完整两列、且左侧放得下 → 模型列翻到 provider
+      // 左侧（仅双列时判定；单列/色板视图永不翻转）。
+      let flipped = false;
+      if (clientW > 0 && mw > 0) {
+        const spaceRight = clientW - rightAnchor;
+        const spaceLeft = leftAnchor;
+        if (spaceRight + margin < totalWidth && spaceLeft - margin >= totalWidth) flipped = true;
+      }
+
       let left;
-      if (width > 0) {
-        left = leftAnchor;
-        if (left + totalWidth > width - margin) left = width - margin - totalWidth;
-        left = Math.max(margin, Math.min(left, width - totalWidth - margin));
+      if (clientW > 0) {
+        // 未翻转：容器左缘对齐徽标左缘；翻转：容器右缘对齐徽标右缘（镜像）。
+        left = flipped ? rightAnchor - totalWidth : leftAnchor;
+        left = Math.max(margin, Math.min(left, clientW - totalWidth - margin));
       } else {
         left = leftAnchor;
       }
-      return { left, top, totalWidth, providerWidth: pw, modelWidth: mw };
+      return {
+        left,
+        top,
+        totalWidth,
+        providerWidth: pw,
+        modelWidth: mw,
+        flipped,
+        panelMaxHeight: ph,
+      };
     }
 
     /**
@@ -837,7 +905,7 @@ window.__ModuleLoader__.load({
     // provider 列 176 → 200 → 260：额度文案常驻该列右侧，"5h 4% · 7d 35%" 要 200px，
     // 三窗口的 "5h 6% · 7d 36% · 30d 59%"（OpenCode Go）约 25 字符，200px 下显示名
     // 会被挤没，故再放到 260px。定位算法对宽度是参数化的，极窄视口下仍走
-    // cascadePositionFor 的收窄分支。
+    // cascadePlacementFor 的收窄分支。
     const CASCADE_PROVIDER_WIDTH = 260;
     const CASCADE_MODEL_WIDTH = 236;
     const CASCADE_GAP = 6;
@@ -1024,6 +1092,17 @@ window.__ModuleLoader__.load({
       const selecting = pendingSelection !== null
         || (state !== null && typeof state === "object" && state.status === "selecting");
 
+      // 翻转标记：键盘方向映射用（C-3）。
+      //
+      // 定位只在打开时计算一次（见 openCascade）：垂直按 CASCADE_PANEL_HEIGHT
+      // 预留、水平按两列总宽 + clientWidth。**打开后刻意不再重排**——悬停
+      // 不同 provider 时模型列高度会变（超长列表被 maxHeight 截断 ↔ 短列表
+      // 只有几十像素），若按实测高度回搬弹层，会形成「高度变化 → 弹层跳动 →
+      // 行在静止光标下移动 → 浏览器补发 mouseenter → hover 到另一 provider →
+      // 高度再变」的抖动回路（2026-10-19 用户实测抖动，已修正）。页面滚动/
+      // 窗口 resize 仍直接关闭（README 既有设计）。
+      const cascadeFlipped = cascade !== null && cascade.flipped === true;
+
       const typeAhead = (key) => {
         const now = Date.now();
         const buf = keyBufferRef.current;
@@ -1068,26 +1147,46 @@ window.__ModuleLoader__.load({
           event.stopPropagation();
         }
         if (cascade !== null) { closeCascade(); return; }
+        let idx = rows.findIndex((r) => r.id === currentProviderId && !r.disabled);
+        if (idx < 0) idx = nextEnabledIndex(rows, -1, 1);
+        const row = idx >= 0 ? rows[idx] : undefined;
         let position = {
           left: 0,
           top: 0,
           totalWidth: CASCADE_PROVIDER_WIDTH + CASCADE_GAP + CASCADE_MODEL_WIDTH,
           providerWidth: CASCADE_PROVIDER_WIDTH,
           modelWidth: CASCADE_MODEL_WIDTH,
+          flipped: false,
+          panelMaxHeight: CASCADE_PANEL_HEIGHT,
         };
         try {
-          const rect = event !== null && typeof event === "object" && event.currentTarget !== null
-            ? event.currentTarget.getBoundingClientRect()
+          const anchorEl = badgeRef.current !== null && badgeRef.current !== undefined
+            && typeof badgeRef.current.getBoundingClientRect === "function"
+            ? badgeRef.current
+            : (event !== null && typeof event === "object" ? event.currentTarget : null);
+          const rect = anchorEl !== null && anchorEl !== undefined
+            && typeof anchorEl.getBoundingClientRect === "function"
+            ? anchorEl.getBoundingClientRect()
             : undefined;
           const viewport = typeof window !== "undefined"
-            ? { width: window.innerWidth, height: window.innerHeight }
+            ? {
+              width: window.innerWidth,
+              height: window.innerHeight,
+              clientWidth: typeof document !== "undefined"
+                && document.documentElement !== null
+                && typeof document.documentElement.clientWidth === "number"
+                ? document.documentElement.clientWidth : undefined,
+            }
             : undefined;
-          position = cascadePositionFor(rect, viewport,
+          // 定位只在打开时计算一次，恒按**两列满预算**：垂直按
+          // CASCADE_PANEL_HEIGHT(340) 预留（面板 maxHeight 上限，悬停切换
+          // provider 不会超过），水平按 260+6+236 与 clientWidth。即使打开
+          // 时当前行无模型也预留模型列空间，后续悬停其它 provider 弹出模型
+          // 列时位置已就绪。打开后不再重排（防抖动回路，见 cascadeFlipped
+          // 上方注释）。
+          position = cascadePlacementFor(rect, viewport,
             CASCADE_PROVIDER_WIDTH, CASCADE_MODEL_WIDTH, CASCADE_GAP, CASCADE_PANEL_HEIGHT);
         } catch (_) { /* 无 DOM 环境不做定位；菜单落在 (0,0) 不影响逻辑 */ }
-        let idx = rows.findIndex((r) => r.id === currentProviderId && !r.disabled);
-        if (idx < 0) idx = nextEnabledIndex(rows, -1, 1);
-        const row = idx >= 0 ? rows[idx] : undefined;
         setCascade(position);
         setColorMode(false);
         setActiveProviderId(row !== undefined ? row.id : null);
@@ -1169,7 +1268,7 @@ window.__ModuleLoader__.load({
           else if (key === "ArrowUp") { consume(); moveProvider(-1); }
           else if (key === "Home") { consume(); moveProviderEdge("first"); }
           else if (key === "End") { consume(); moveProviderEdge("last"); }
-          else if (key === "ArrowRight" || key === "Enter") { consume(); enterModels(); }
+          else if (key === (cascadeFlipped ? "ArrowLeft" : "ArrowRight") || key === "Enter") { consume(); enterModels(); }
           else if (printable) {
             consume();
             const idx = providerIndexByPrefix(rows, typeAhead(key), providerIndex);
@@ -1181,7 +1280,7 @@ window.__ModuleLoader__.load({
           else if (key === "ArrowUp") { consume(); setModelIndex((i) => (i - 1 + activeModels.length) % activeModels.length); }
           else if (key === "Home") { consume(); setModelIndex(0); }
           else if (key === "End") { consume(); setModelIndex(activeModels.length - 1); }
-          else if (key === "ArrowLeft") { consume(); setFocusLevel("providers"); }
+          else if (key === (cascadeFlipped ? "ArrowRight" : "ArrowLeft")) { consume(); setFocusLevel("providers"); }
           else if (key === "Enter") {
             consume();
             const model = activeModels[modelIndex];
@@ -1259,6 +1358,12 @@ window.__ModuleLoader__.load({
       };
 
       let providerPanel;
+      // 面板 maxHeight：视口过矮时 cascadePlacementFor 已收缩（见其
+      // panelMaxHeight），保证超长列表的尾部与内部滚动条不坠出视口。
+      const panelMaxHeight = cascade.panelMaxHeight !== null
+        && typeof cascade.panelMaxHeight === "number" && cascade.panelMaxHeight > 0
+        ? cascade.panelMaxHeight : CASCADE_PANEL_HEIGHT;
+
       if (colorMode) {
         // 一级面板切到原有色板视图（复用 localStorage），可返回 provider 列表。
         const backEl = h("button", {
@@ -1307,7 +1412,7 @@ window.__ModuleLoader__.load({
           },
         }, Object.prototype.hasOwnProperty.call(overrides, badge.routeId) ? "恢复自动配色" : "自动配色");
         providerPanel = h("div",
-          { key: "__providers", role: "listbox", "aria-label": badge.title, style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px" } },
+          { key: "__providers", role: "listbox", "aria-label": badge.title, style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px", maxHeight: panelMaxHeight + "px" } },
           backEl, gridEl, autoEl,
         );
       } else {
@@ -1337,10 +1442,15 @@ window.__ModuleLoader__.load({
           // 命中 row.id 即可渲染（openai-codex / kimi-coding 走同一段代码）。
           const quotaEntry = quotaRoutes !== null && typeof quotaRoutes === "object"
             && Object.prototype.hasOwnProperty.call(quotaRoutes, row.id) ? quotaRoutes[row.id] : null;
-          const quotaText = quotaInlineTextOf(quotaEntry);
-          const quotaTone = quotaText !== null ? quotaToneOf(quotaEntry) : null;
-          const quotaColor = quotaTone !== null ? QUOTA_TONES[quotaTone] : null;
-          const quotaTitle = quotaText !== null ? quotaTitleOf(quotaEntry) : null;
+          const quotaFailure = quotaFailureOf(quotaEntry);
+          const quotaSuccessText = quotaInlineTextOf(quotaEntry);
+          const quotaText = quotaSuccessText !== null ? quotaSuccessText
+            : (quotaFailure !== null ? quotaFailure.text : null);
+          const quotaTone = quotaSuccessText !== null ? quotaToneOf(quotaEntry) : null;
+          const quotaColor = quotaFailure !== null ? QUOTA_TONES.warn
+            : (quotaTone !== null ? QUOTA_TONES[quotaTone] : null);
+          const quotaTitle = quotaSuccessText !== null ? quotaTitleOf(quotaEntry)
+            : (quotaFailure !== null ? quotaFailure.title : null);
           const quotaEl = quotaText === null ? null : h("span", {
             key: "quota",
             "data-provider-badge-quota": row.id,
@@ -1426,7 +1536,7 @@ window.__ModuleLoader__.load({
         h("span", { key: "label", style: { flex: "1 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "徽标颜色…"),
         ));
         providerPanel = h("div",
-          { key: "__providers", role: "listbox", "aria-label": badge.title, style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px" } },
+          { key: "__providers", role: "listbox", "aria-label": badge.title, style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px", maxHeight: panelMaxHeight + "px" } },
           providerRowEls,
         );
       }
@@ -1471,7 +1581,7 @@ window.__ModuleLoader__.load({
           );
         });
         panels.push(h("div",
-          { key: "__models", role: "listbox", "aria-label": activeRow.name, style: { ...PANEL_BASE_STYLE, width: cascade.modelWidth + "px" } },
+          { key: "__models", role: "listbox", "aria-label": activeRow.name, style: { ...PANEL_BASE_STYLE, width: cascade.modelWidth + "px", maxHeight: panelMaxHeight + "px" } },
           modelRowEls,
         ));
       }
@@ -1488,13 +1598,21 @@ window.__ModuleLoader__.load({
           top: cascade.top,
           zIndex: 1200,
           display: "flex",
-          flexDirection: "row",
+          flexDirection: cascade.flipped === true ? "row-reverse" : "row",
           gap: CASCADE_GAP + "px",
           letterSpacing: "0",
         },
       }, SPIN_KEYFRAMES, ...panels);
 
-      return [badgeEl, cascadeEl];
+      // portal 到 document.body：脱离 composer 子树，规避祖先
+      // transform/filter/overflow 劫持 position:fixed 的包含块与裁剪（改进
+      // 方案 C-1）。宿主缺 react-dom 或无 document（探针沙箱）时内联渲染。
+      const portalTarget = typeof document !== "undefined" ? document.body : null;
+      const cascadeTree = createPortal !== null && portalTarget !== null
+        ? createPortal(cascadeEl, portalTarget)
+        : cascadeEl;
+
+      return [badgeEl, cascadeTree];
     }
 
     /* ── 注册 ─────────────────────────────────────────────────────── */
@@ -1529,10 +1647,10 @@ window.__ModuleLoader__.load({
       parseColor, relativeLuminance, inkFor, wheelDist, hueSlotsFor, routeIdsOf,
       colorOf, resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
       badgeOf, faceOf, UNAVAILABLE,
-      selectionFor, cascadePositionFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
+      selectionFor, cascadePlacementFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
       shouldCloseOnScroll,
       QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,
-      formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaTitleOf, quotaToneOf,
+      formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaFailureOf, quotaTitleOf, quotaToneOf,
       formatMoney, extraUsageParts, CURRENCY_SYMBOLS,
     };
 

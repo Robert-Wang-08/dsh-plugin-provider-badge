@@ -61,8 +61,8 @@ check('H1 kimi 数据源走 apiKeyEnv 引用并回退 KIMI_API_KEY', QUOTA_SOURC
 check('H1 kimi 上游走 /coding/v1/usages', QUOTA_SOURCES['kimi-coding'].url === 'https://api.kimi.com/coding/v1/usages')
 check('H1 opencode-go 数据源走 apiKeyEnv 引用并回退 OPENCODE_API_KEY', QUOTA_SOURCES['opencode-go'].auth.kind === 'ref'
   && QUOTA_SOURCES['opencode-go'].auth.fallbackRefs.join(',') === 'OPENCODE_API_KEY')
-check('H1 opencode-go 上游走 /inference/go/v1/usage（文档端点族）',
-  QUOTA_SOURCES['opencode-go'].url === 'https://opencode.ai/inference/go/v1/usage')
+check('H1 opencode-go 上游走 /zen/go/v1/usage（当前 CLI 推导路径）',
+  QUOTA_SOURCES['opencode-go'].url === 'https://opencode.ai/zen/go/v1/usage')
 check('H1 三条数据源的 headers 只额外加 Codex 专属头', (() => {
   const codex = QUOTA_SOURCES['openai-codex'].headers({ accountId: 'acct-1' })
   return Object.keys(codex).length === 3 && codex.originator === 'pi'
@@ -158,6 +158,16 @@ const REAL_OPENCODE_PAYLOAD = {
     weekly: { status: 'ok', percent: 36, resetsAt: '2026-10-19T00:00:00.000Z' },
     monthly: { status: 'ok', percent: 59, resetsAt: '2026-10-20T09:24:52.000Z' },
   },
+}
+/** OpenCode 当前 usage 路由的新结构（PR #32913）：plan + windows[]。 */
+const CURRENT_OPENCODE_PAYLOAD = {
+  plan: 'lite',
+  windows: [
+    { name: 'weekly', status: 'ok', usagePercent: 36, resetInSec: 455917 },
+    { name: '5-hour', status: 'ok', usagePercent: 6, resetInSec: 13363 },
+    { name: 'monthly', status: 'ok', usagePercent: 59, resetInSec: 1188832 },
+  ],
+  useBalance: false,
 }
 /** 实测响应（裁剪保真：usages + usage + limits + 钱包，另加一个不该外泄的标识字段）。 */
 const REAL_KIMI_PAYLOAD = {
@@ -438,11 +448,11 @@ function mountPlugin(credentials, settings) {
 }
 const previousFetch = globalThis.fetch
 try {
-  // 按 URL 分派：Codex 走 wham/usage、Kimi 走 /coding/v1/usages、Go 走 /inference/go/v1/usage。
+  // 按 URL 分派：Codex 走 wham/usage、Kimi 走 /coding/v1/usages、Go 走 /zen/go/v1/usage。
   globalThis.fetch = async (url) => {
     const target = String(url)
     if (target.includes('/usages')) return okResponse(REAL_KIMI_PAYLOAD)
-    if (target.includes('/inference/go/v1/usage')) return okResponse(REAL_OPENCODE_PAYLOAD)
+    if (target.includes('/zen/go/v1/usage')) return okResponse(CURRENT_OPENCODE_PAYLOAD)
     return okResponse(REAL_PAYLOAD)
   }
   const creds = makeCredentials(grantRecord())
@@ -467,7 +477,7 @@ try {
   check('H7 三条数据源都出现在 routes 里（浏览器半按行 id 命中）', body.routes['kimi-coding'] !== undefined
     && body.routes['kimi-coding'].ok === true && body.routes['kimi-coding'].plan === null
     && body.routes['opencode-go'] !== undefined && body.routes['opencode-go'].ok === true
-    && body.routes['opencode-go'].plan === null)
+    && body.routes['opencode-go'].plan === 'lite')
   check('H7 端点响应体不含任何令牌', !ok.body.includes('tok-secret-value') && !ok.body.includes(KIMI_KEY)
     && !ok.body.includes(OPENCODE_KEY))
   check('H7 端点响应体不含账号标识', !ok.body.includes('nobody@example.invalid') && !ok.body.includes('user-x'))
@@ -763,6 +773,13 @@ check('H9 窗口按时长升序（与 JSON 键序无关）', (() => {
 check('H9 重置时刻取 ISO resetsAt', opencodeEntry.windows[0].resetsAt === Date.parse('2026-10-17T08:06:47.000Z') / 1000
   && opencodeEntry.windows[1].resetsAt === Date.parse('2026-10-19T00:00:00.000Z') / 1000)
 check('H9 resetAfterSeconds 不臆造', opencodeEntry.windows.every((w) => w.resetAfterSeconds === null))
+const currentOpencodeEntry = opencodeEntryFromPayload(CURRENT_OPENCODE_PAYLOAD, 1792211220093)
+check('H9 当前 windows[] 响应 → 5h / 7d / 30d 三窗口', currentOpencodeEntry !== null
+  && currentOpencodeEntry.windows.map((w) => w.windowSeconds).join(',') === '18000,604800,2592000'
+  && currentOpencodeEntry.windows.map((w) => w.usedPercent).join(',') === '6,36,59')
+check('H9 当前 windows[] 响应保留套餐和相对重置时间', currentOpencodeEntry.plan === 'lite'
+  && currentOpencodeEntry.windows[0].resetsAt === null && currentOpencodeEntry.windows[0].resetAfterSeconds === 13363
+  && currentOpencodeEntry.windows[2].resetAfterSeconds === 1188832)
 check('H9 套餐名留空（Go 与 Go Plus 不可区分）', opencodeEntry.plan === null)
 check('H9 无余额字段（订阅不含加购余额）', opencodeEntry.credits === null)
 check('H9 status=ok 且未满载 → limitReached false', opencodeEntry.limitReached === false)
@@ -803,7 +820,7 @@ await (async () => {
   const service = createQuotaService({ credentialsOf: () => creds.service, settingsOf: () => settings.service, fetchImpl: stub })
   const res = await service.readOne('opencode-go')
   check('H9 ref 型凭据按 settings 生效的 apiKeyEnv 解析', creds.calls.resolve.join(',') === 'OPENCODE_API_KEY')
-  check('H9 上游 URL 固定', calls[0].url === 'https://opencode.ai/inference/go/v1/usage')
+  check('H9 上游 URL 固定为当前 zen usage 路径', calls[0].url === 'https://opencode.ai/zen/go/v1/usage')
   check('H9 请求头只有 Bearer + accept', calls[0].init.headers.authorization === 'Bearer ' + OPENCODE_KEY
     && calls[0].init.headers.accept === 'application/json'
     && calls[0].init.headers.originator === undefined
