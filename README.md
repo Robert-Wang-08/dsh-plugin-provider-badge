@@ -2,6 +2,10 @@
 
 DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会话输入区的「模型及推理等级」选择器正前方渲染一个 **provider 徽标**，并在点开的 provider 级联菜单里为支持的路由显示 **可用额度**（当前为 OpenAI Codex、Kimi、OpenCode Go 三家的窗口用量）。本轮实现与探针基于宿主 `0.2.0-rc.2`。
 
+实际渲染（composer 右下角，绿色 `opengo` 徽标 + 模型选择器）：
+
+![badge-composer](docs/screenshots/badge-composer.png)
+
 ```
 [AGLM] my-model ▾   ···   [发送]
   ↑
