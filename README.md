@@ -45,6 +45,7 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 | --- | --- |
 | `version` | 协议版本；任一侧改动必须同步升版本，版本不符时消费方中性降级 |
 | `presentationFor(sessionId)` | 返回 `{ getSnapshot, subscribe, load }` 句柄；目录未装载 / subagent 转址会话 / 解析抛错 → `null` |
+| `colorFor(providerId, providerIds?)` | 不依赖会话目录的纯色表查询：返回 `{ color, ink, text, providerId, providerName }`；未入 `ROUTE_COLORS` 的路由按传入集合均匀铺槽。侧栏用它给**未驻留**的会话上色 |
 | `getSnapshot()` | `{ color, ink, text, providerId, providerName, modelId, modelName }`；状态未变时返回同一对象（`useSyncExternalStore` 安全），无当前选择时 `null` |
 
 - 安装后广播一次 `dsh-provider-badge:bridge` 事件，桥晚于消费方渲染时也能立即接上；ctx 释放时摘除桥。

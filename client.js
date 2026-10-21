@@ -1711,6 +1711,40 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 纯色表查询（不依赖 ModelDirectory）：给定 provider 路由 id 与可见 provider
+     * 集合，按与徽标完全相同的优先级返回 { color, ink, text }。
+     *
+     * 用于侧栏列表里**未驻留**的会话 —— 那些会话拿不到共享目录，但会话投影里
+     * 已带 provider/模型，只要有这个纯函数就能上色，不必打开会话。
+     * 未入 ROUTE_COLORS 的路由按传入集合均匀铺槽（与徽标同一套色阶）。
+     */
+    function colorPresentationFor(providerId, providerIds) {
+      if (typeof providerId !== "string" || providerId.length === 0) return null;
+      const ids = Array.isArray(providerIds)
+        ? providerIds.filter((id) => typeof id === "string" && id.length > 0)
+        : [];
+      if (!ids.includes(providerId)) ids.push(providerId);
+      const state = {
+        current: { provider: providerId, model: "" },
+        groups: ids.map((id) => ({ id, name: id, models: [] })),
+        status: "ready",
+      };
+      const color = resolveColor(providerId, state, loadOverrides());
+      const label = Object.prototype.hasOwnProperty.call(ROUTE_LABELS, providerId)
+        ? ROUTE_LABELS[providerId] : null;
+      const text = label !== null ? label : deriveLetters(providerId, providerId);
+      if (text === null) return null;
+      return Object.freeze({
+        color,
+        ink: inkFor(color),
+        text,
+        providerId,
+        providerName: providerId,
+        modelId: "",
+        modelName: "",
+      });
+    }
+    /**
      * 安装桥并广播一次 `dsh-provider-badge:bridge` 事件（消费方可能在桥安装前
      * 已渲染）。ctx 释放时摘除，避免热重载后留下指向旧 ctx 的句柄。
      */
@@ -1718,6 +1752,13 @@ window.__ModuleLoader__.load({
       if (typeof window === "undefined" || window === null) return;
       const bridge = {
         version: BRIDGE_VERSION,
+        colorFor: (providerId, providerIds) => {
+          try {
+            return colorPresentationFor(providerId, providerIds);
+          } catch (_) {
+            return null;
+          }
+        },
         presentationFor: (sessionId) => {
           try {
             if (typeof sessionId !== "string" || sessionId.length === 0) return null;
@@ -1777,7 +1818,7 @@ window.__ModuleLoader__.load({
       parseColor, relativeLuminance, inkFor, wheelDist, hueSlotsFor, routeIdsOf,
       colorOf, resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
       badgeOf, faceOf, UNAVAILABLE, presentationOf,
-      BRIDGE_GLOBAL, BRIDGE_EVENT, BRIDGE_VERSION,
+      BRIDGE_GLOBAL, BRIDGE_EVENT, BRIDGE_VERSION, colorPresentationFor,
       selectionFor, cascadePlacementFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
       shouldCloseOnScroll,
       QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,
