@@ -36,6 +36,23 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 | 账单段 | 条目带 `extraUsage`（当前只有 Kimi）时，悬停说明**末尾**追加 `本月已用 ¥0.00 · 月度上限 Unlimited · 加购余额 ¥32.77`；钱包状态非 `STATUS_ACTIVE` 时余额后标注（如 `（钱包已停用 STATUS_DISABLED）`）。**只进悬停说明**，行内文本与列宽零影响；`extraUsage` 缺失或字段不全时该段整体不出现 |
 | 降级 | subagent 转址会话、`modelDirectories` 未装载、目录解析抛错、无当前选择 → 渲染为空，不报错不占位；额度端点不可达时不渲染，端点返回路由级 `ok:false` 时显示脱敏短状态（需登录 / 未配置 / 不可用），其余行为零变化 |
 
+## 跨插件只读桥（侧栏运行行取模型配色）
+
+`apply()` 在 `window.__DSH_PROVIDER_BADGE__` 安装一个版本化只读桥（当前 `version: 1`），供
+`dsh-plugin-sidebar-visibility` 的运行中标识取「该会话所选 provider 的颜色 / 字色 / 徽标文字 / 模型名」：
+
+| 成员 | 语义 |
+| --- | --- |
+| `version` | 协议版本；任一侧改动必须同步升版本，版本不符时消费方中性降级 |
+| `presentationFor(sessionId)` | 返回 `{ getSnapshot, subscribe, load }` 句柄；目录未装载 / subagent 转址会话 / 解析抛错 → `null` |
+| `getSnapshot()` | `{ color, ink, text, providerId, providerName, modelId, modelName }`；状态未变时返回同一对象（`useSyncExternalStore` 安全），无当前选择时 `null` |
+
+- 安装后广播一次 `dsh-provider-badge:bridge` 事件，桥晚于消费方渲染时也能立即接上；ctx 释放时摘除桥。
+- 颜色走 `resolveColor`（用户自选色 > `ROUTE_COLORS` > 自动调色板），字色走 `inkFor`，模型名取自同一份
+  `ModelDirectoryState` —— 侧栏**不复制色表**，两处永远同源。
+- 只暴露展示事实：不暴露 `select`、不读凭据、不写 settings。
+- 语义与徽标一致：反映**会话选择**的 provider/模型，不反映运行期故障转移后的实际执行模型。
+
 ## 明确非目标
 
 - **不反映运行期故障转移重路由**：分档切换对 UI 透明是既有设计；徽标与官方模型席位同口径，反映**会话选择**的 provider。

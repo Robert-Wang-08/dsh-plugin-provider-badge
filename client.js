@@ -1615,6 +1615,135 @@ window.__ModuleLoader__.load({
       return [badgeEl, cascadeTree];
     }
 
+    /* ── 跨插件只读展示桥（sidebar 运行行取模型配色） ─────────────────── */
+
+    /**
+     * 版本化只读全局桥：`window.__DSH_PROVIDER_BADGE__`。
+     *
+     * 约定（`dsh-plugin-sidebar-visibility` 的运行中标识消费）：
+     * - 只暴露展示事实，不暴露 select / 凭据 / settings 写入；
+     * - `presentationFor(sessionId)` 返回与徽标同一份目录 store 的订阅句柄，
+     *   颜色走 `resolveColor`（用户自选色 > ROUTE_COLORS > 自动调色板），
+     *   字色走 `inkFor`，因此侧栏颜色与输入框徽标严格同源；
+     * - 目录未装载 / subagent 转址会话 / 无当前选择 → null，消费方中性降级；
+     * - 句柄按调用现造，不缓存 store（会话 scope 释放后不残留失效句柄）。
+     *
+     * 语义边界（与徽标一致）：颜色/模型是**会话所选**的 provider 与模型，
+     * 不反映运行期故障转移后的实际执行模型。
+     */
+    const BRIDGE_GLOBAL = "__DSH_PROVIDER_BADGE__";
+    const BRIDGE_EVENT = "dsh-provider-badge:bridge";
+    const BRIDGE_VERSION = 1;
+
+    function presentationOf(ctx, sessionId) {
+      const face = faceOf(ctx, sessionId);
+      if (face === UNAVAILABLE) return null;
+      const store = face.store;
+      let cached = null;
+      const compute = () => {
+        let state;
+        try {
+          state = store.getSnapshot();
+        } catch (_) {
+          return null;
+        }
+        const badge = badgeOf(state);
+        if (badge === null) return null;
+        const color = resolveColor(badge.routeId, state, loadOverrides());
+        let providerName = badge.routeId;
+        let modelId = "";
+        let modelName = "";
+        const current = state.current;
+        if (current !== null && typeof current === "object" && typeof current.model === "string") {
+          modelId = current.model;
+          modelName = current.model;
+        }
+        if (Array.isArray(state.groups)) {
+          const group = state.groups.find(
+            (g) => g !== null && typeof g === "object" && g.id === badge.routeId,
+          );
+          if (group !== undefined) {
+            if (typeof group.name === "string" && group.name.trim().length > 0) providerName = group.name;
+            if (modelId !== "" && Array.isArray(group.models)) {
+              const model = group.models.find(
+                (m) => m !== null && typeof m === "object" && m.id === modelId,
+              );
+              if (model !== undefined && typeof model.name === "string") modelName = model.name;
+            }
+          }
+        }
+        return Object.freeze({
+          color,
+          ink: inkFor(color),
+          text: badge.text,
+          providerId: badge.routeId,
+          providerName,
+          modelId,
+          modelName,
+        });
+      };
+      return {
+        getSnapshot: () => {
+          const next = compute();
+          if (next === null) {
+            cached = null;
+            return null;
+          }
+          if (cached !== null
+            && cached.color === next.color && cached.ink === next.ink && cached.text === next.text
+            && cached.providerName === next.providerName
+            && cached.modelId === next.modelId && cached.modelName === next.modelName) {
+            return cached;
+          }
+          cached = next;
+          return cached;
+        },
+        subscribe: (listener) => {
+          if (typeof listener !== "function") return () => {};
+          try {
+            return store.subscribe(listener);
+          } catch (_) {
+            return () => {};
+          }
+        },
+        load: face.load,
+      };
+    }
+
+    /**
+     * 安装桥并广播一次 `dsh-provider-badge:bridge` 事件（消费方可能在桥安装前
+     * 已渲染）。ctx 释放时摘除，避免热重载后留下指向旧 ctx 的句柄。
+     */
+    function installPresentationBridge(ctx) {
+      if (typeof window === "undefined" || window === null) return;
+      const bridge = {
+        version: BRIDGE_VERSION,
+        presentationFor: (sessionId) => {
+          try {
+            if (typeof sessionId !== "string" || sessionId.length === 0) return null;
+            return presentationOf(ctx, sessionId);
+          } catch (_) {
+            return null;
+          }
+        },
+      };
+      window[BRIDGE_GLOBAL] = bridge;
+      try {
+        window.dispatchEvent(new Event(BRIDGE_EVENT));
+      } catch (_) { /* 旧宿主缺 Event 构造：消费方下次渲染自行读取 */ }
+      if (typeof ctx.effect === "function") {
+        ctx.effect(() => () => {
+          if (window[BRIDGE_GLOBAL] === bridge) {
+            try {
+              delete window[BRIDGE_GLOBAL];
+            } catch (_) {
+              window[BRIDGE_GLOBAL] = undefined;
+            }
+          }
+        }, "provider-badge: presentation bridge");
+      }
+    }
+
     /* ── 注册 ─────────────────────────────────────────────────────── */
 
     /**
@@ -1628,6 +1757,7 @@ window.__ModuleLoader__.load({
     const inject = ["slots", "sessions", "modelDirectories", "remote", "remote.session"];
 
     function apply(ctx) {
+      installPresentationBridge(ctx);
       ctx.slots.inject("conversation.input.right", () =>
         ctx.slots.register(
           {
@@ -1646,7 +1776,8 @@ window.__ModuleLoader__.load({
       fourLetters, deriveLetters, hash32, ROUTE_COLORS, ROUTE_LABELS, STORAGE_KEY, PALETTE,
       parseColor, relativeLuminance, inkFor, wheelDist, hueSlotsFor, routeIdsOf,
       colorOf, resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
-      badgeOf, faceOf, UNAVAILABLE,
+      badgeOf, faceOf, UNAVAILABLE, presentationOf,
+      BRIDGE_GLOBAL, BRIDGE_EVENT, BRIDGE_VERSION,
       selectionFor, cascadePlacementFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
       shouldCloseOnScroll,
       QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,
