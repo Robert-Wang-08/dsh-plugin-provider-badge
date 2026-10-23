@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-provider-badge",
-  "description": "DSH Web 增强插件：在会话输入框下方模型及推理等级选择器正前方渲染 provider 徽标（ROUTE_LABELS 缩写表/显示名推导，黑体对比字色、ROUTE_COLORS 色表/调色板底，随会话选择即时跟随；点徽标选色并持久化到 localStorage）。点开级联菜单时，为支持的路由在该行右侧显示可用额度（OpenAI Codex / Kimi / OpenCode Go 的窗口已用百分比，经宿主只读端点 /provider-badge/quota 取数；失败显示脱敏状态）。不写 settings、不介入模型请求、不代管凭据。",
-  "version": "0.2.4",
+  "description": "DSH Web 增强插件：在会话输入框下方模型及推理等级选择器正前方渲染 provider 徽标（ROUTE_LABELS 缩写表/显示名推导，黑体对比字色、ROUTE_COLORS 色表/调色板底，随会话选择即时跟随；点徽标选色并持久化到 localStorage）。点开级联菜单时，为支持的路由在该行右侧显示可用额度（OpenAI Codex / Kimi / OpenCode Go 的窗口已用百分比，经宿主只读端点 /provider-badge/quota 取数；失败显示脱敏状态）。徽标左侧另有最多 6 个可配置的常用模型一键切换胶囊（默认 ais2dsglm/glm/codex-relay/opencodego/openai-codex/kimi 各一，单击即切换，配置存 localStorage）。不写 settings、不介入模型请求、不代管凭据。",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "main": "index.js",

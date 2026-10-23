@@ -126,12 +126,51 @@ const {
   formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaFailureOf, quotaTitleOf, quotaToneOf,
   formatMoney, extraUsageParts, CURRENCY_SYMBOLS,
   ROUTE_ALIASES, canonicalRouteId, aliasLookup, colorPresentationFor,
+  QUICK_MAX_SLOTS, QUICK_STORAGE_KEY, DEFAULT_QUICK_MODELS, QUICK_LABEL_MAX,
+  quickLabelOf, normalizeQuickModels, defaultQuickModels, loadQuickModels, saveQuickModels, quickStatusOf,
 } = exports_.__test
 
 /** 组件渲染入口：每次渲染前把 useSub 序号归零，保证播种序号稳定。 */
 function renderComponent(props) {
   hookIndex = 0
   return registration !== null ? registration.component(props) : null
+}
+
+/**
+ * 从渲染树里找徽标节点：分组容器（data-provider-badge-group）下第 2 个子节点，
+ * 也可递归命中 data-provider-badge-badge。组件现在返回「按钮组 + 徽标」的包装，
+ * 既有徽标断言统一经此解包，避免断言依赖具体 children 位置。
+ */
+function badgeNodeOf(node) {
+  if (node === null || node === undefined || typeof node !== 'object') return null
+  if (node.props !== undefined && node.props !== null && node.props['data-provider-badge-badge'] === true) return node
+  const children = node.props !== undefined && node.props !== null && Array.isArray(node.props.children) ? node.props.children : []
+  for (const child of children) {
+    const hit = badgeNodeOf(child)
+    if (hit !== null) return hit
+  }
+  return null
+}
+
+/** 假 react 会把单个文本子节点也包成数组：读取节点文本时统一拍平。 */
+function textOfNode(node) {
+  if (node === null || node === undefined || typeof node !== 'object') return ''
+  const kids = node.props !== undefined && node.props !== null ? node.props.children : undefined
+  if (Array.isArray(kids)) return kids.map((k) => (typeof k === 'string' ? k : textOfNode(k))).join('')
+  return typeof kids === 'string' ? kids : ''
+}
+
+/** 分组容器 → 常用模型按钮数组（按渲染顺序）。 */
+function quickNodesOf(node) {
+  const out = []
+  const walk = (n) => {
+    if (n === null || n === undefined || typeof n !== 'object') return
+    if (n.props !== undefined && n.props !== null && n.props['data-provider-badge-quick'] !== undefined) out.push(n)
+    const children = n.props !== undefined && n.props !== null && Array.isArray(n.props.children) ? n.props.children : []
+    for (const child of children) walk(child)
+  }
+  walk(node)
+  return out
 }
 
 /* ── S4 v2：文本推导（4 字母：多词首字母，不足补尾字母，无符号） ───── */
@@ -340,16 +379,20 @@ const renderState = {
 }
 const renderStore = { subscribe: () => () => {}, getSnapshot: () => renderState }
 const rendered = renderComponent({ store: renderStore, load: () => {} })
-const childText = Array.isArray(rendered?.props?.children) ? rendered.props.children.join('') : rendered?.props?.children
+const renderedBadge = badgeNodeOf(rendered)
+const childText = renderedBadge !== null && Array.isArray(renderedBadge.props.children)
+  ? renderedBadge.props.children.join('') : renderedBadge?.props?.children
+check('渲染：分组容器包裹按钮组 + 徽标', rendered !== null && rendered.type === 'span'
+  && rendered.props['data-provider-badge-group'] === true)
 check('渲染：徽标 span + 4 字母文本 + title + 调色板底色 + 对比字色',
-  rendered !== null && rendered.type === 'span'
+  renderedBadge !== null && renderedBadge.type === 'span'
   && childText === 'AOne'
-  && rendered.props.title === 'Alpha One (provider-alpha)'
-  && rendered.props.style.background === colorOf('provider-alpha', renderState)
-  && PALETTE.includes(rendered.props.style.background)
-  && rendered.props.style.color === inkFor(rendered.props.style.background)
-  && rendered.props.style.fontWeight === 700
-  && rendered.props.style.height === '16px')
+  && renderedBadge.props.title === 'Alpha One (provider-alpha)'
+  && renderedBadge.props.style.background === colorOf('provider-alpha', renderState)
+  && PALETTE.includes(renderedBadge.props.style.background)
+  && renderedBadge.props.style.color === inkFor(renderedBadge.props.style.background)
+  && renderedBadge.props.style.fontWeight === 700
+  && renderedBadge.props.style.height === '16px')
 check('渲染：数据缺失 → null', renderComponent(UNAVAILABLE) === null)
 check('渲染：store 快照为空 → null', renderComponent({ store: { subscribe: () => () => {}, getSnapshot: () => ({ current: null }) } }) === null)
 
@@ -380,19 +423,21 @@ check('S5c swatchColors 非空且全部可解析', Array.isArray(swatches) && sw
 check('S5c swatchColors 含六个默认路由色', Object.values(ROUTE_COLORS).every((c) => swatches.includes(c)))
 check('S5c swatchColors 去重', new Set(swatches).size === swatches.length)
 
-check('渲染：点击处理器与 root 标记就位', rendered !== null && typeof rendered.props.onClick === 'function' && rendered.props['data-provider-badge-root'] === true)
+check('渲染：点击处理器与 root 标记就位', renderedBadge !== null && typeof renderedBadge.props.onClick === 'function' && renderedBadge.props['data-provider-badge-root'] === true)
 check('渲染：点击在无 DOM 环境不抛（面板保持关闭）', (() => {
-  try { rendered.props.onClick({ stopPropagation() {}, currentTarget: null }); return true }
+  try { renderedBadge.props.onClick({ stopPropagation() {}, currentTarget: null }); return true }
   catch (e) { console.error(e); return false }
 })())
 fakeLS.store[STORAGE_KEY] = JSON.stringify({ 'provider-alpha': '#123456' })
 const renderedCovered = renderComponent({ store: renderStore, load: () => {} })
-const coveredChild = Array.isArray(renderedCovered?.props?.children) ? renderedCovered.props.children.join('') : renderedCovered?.props?.children
+const coveredBadge = badgeNodeOf(renderedCovered)
+const coveredChild = coveredBadge !== null && Array.isArray(coveredBadge.props.children)
+  ? coveredBadge.props.children.join('') : coveredBadge?.props?.children
 check('渲染：localStorage 覆盖色优先于调色板',
-  renderedCovered !== null && renderedCovered.type === 'span'
+  coveredBadge !== null && coveredBadge.type === 'span'
   && coveredChild === 'AOne'
-  && renderedCovered.props.style.background === '#123456'
-  && renderedCovered.props.style.color === inkFor('#123456'))
+  && coveredBadge.props.style.background === '#123456'
+  && coveredBadge.props.style.color === inkFor('#123456'))
 delete fakeLS.store[STORAGE_KEY]
 
 /* ── S5d：选色面板自适应定位（panelPositionFor） ─────────────────── */
@@ -855,6 +900,11 @@ const rowsOfPanel = (panel) => {
 }
 const rowOfId = (rows, id) => rows.find((row) => row !== null && row !== undefined
   && row.props !== undefined && row.props['data-provider-row'] === id)
+/** 面板内的 provider 行数（排除底部动作行：选色 / 常用模型 / 指派提示）。 */
+const providerRowCount = (rows) => rows.filter((row) => row !== null && row !== undefined
+  && row.props !== undefined && row.props['data-provider-row'] !== undefined).length
+const actionOf = (rows, attr) => rows.find((row) => row !== null && row !== undefined
+  && row.props !== undefined && row.props[attr] !== undefined)
 const quotaSpanOfRow = (row) => {
   if (row === undefined || !Array.isArray(row.props.children)) return undefined
   return row.props.children.find((child) => child !== null && child !== undefined
@@ -876,9 +926,11 @@ const openRender = renderOpenCascade()
 stateSeeds.clear()
 
 check('S10b 播种生效：级联打开且 provider/model 两列就位', openRender.panels.length === 2)
-check('S10b provider 列含两行 + 选色入口，额度状态按缓存就位',
-  openRender.rows.length === 3 && rowOfId(openRender.rows, 'openai-codex') !== undefined
-  && rowOfId(openRender.rows, 'ais-2dsglm') !== undefined)
+check('S10b provider 列含两行 + 选色/常用模型入口，额度状态按缓存就位',
+  providerRowCount(openRender.rows) === 2 && rowOfId(openRender.rows, 'openai-codex') !== undefined
+  && rowOfId(openRender.rows, 'ais-2dsglm') !== undefined
+  && actionOf(openRender.rows, 'data-provider-badge-color-action') !== undefined
+  && actionOf(openRender.rows, 'data-provider-badge-quick-action') !== undefined)
 
 const codexRow = rowOfId(openRender.rows, 'openai-codex')
 const codexQuota = quotaSpanOfRow(codexRow)
@@ -944,7 +996,7 @@ check('S10b Kimi 行同样渲染（本半按行 id 命中，不认识具体 prov
   const text = quotaTextOfSpan(span)
   const title = span !== undefined ? span.props.title : null
   quotaRenderState.groups.pop()
-  return rows.length === 4 && typeof text === 'string' && text.startsWith('5h 0% · 7d 100% · 重置 ')
+  return providerRowCount(rows) === 3 && typeof text === 'string' && text.startsWith('5h 0% · 7d 100% · 重置 ')
     && span !== undefined && span.props.style.color === QUOTA_TONES.danger
     && typeof title === 'string' && title.includes('7d 已用 100%') && !title.includes('套餐')
 })())
@@ -957,7 +1009,7 @@ check('S10b OpenCode Go 行渲染三窗口（provider 列 260px）', (() => {
   const span = quotaSpanOfRow(rowOfId(rows, 'opencode-go'))
   const text = quotaTextOfSpan(span)
   quotaRenderState.groups.pop()
-  return rows.length === 4 && typeof text === 'string' && text.startsWith('5h 6% · 7d 36% · 30d 59% · 重置 ')
+  return providerRowCount(rows) === 3 && typeof text === 'string' && text.startsWith('5h 6% · 7d 36% · 30d 59% · 重置 ')
     && span !== undefined && span.props.style.flex === 'none'
     && typeof span.props.title === 'string' && span.props.title.includes('30d 已用 59%')
 })())
@@ -1004,6 +1056,243 @@ check('S10b 源码：级联打开时才请求额度端点，端点整体不可�
   && /if \(!cascadeOpen\) return undefined;/.test(source))
 check('S10b 源码：额度不写 settings/不碰凭据（客户端半零凭据引用）',
   !/credentials/.test(source) && !/localStorage\.setItem\(\s*["']dsh-plugin-provider-badge:quota/.test(source))
+
+/* ── S11：常用模型快捷按钮（徽标左侧 6 槽一键切换 + 可配置） ─────────── */
+
+check('S11 默认 6 个绑定且顺序与需求一致', QUICK_MAX_SLOTS === 6
+  && DEFAULT_QUICK_MODELS.length === QUICK_MAX_SLOTS
+  && JSON.stringify(DEFAULT_QUICK_MODELS.map((e) => e.provider + '/' + e.model)) === JSON.stringify([
+    'ais-2dsglm/deepseek-v4.1-flash',
+    'ais-2dsglm/glm-5.3-flash',
+    'codex-relay/gpt-6.1-sol',
+    'opencodego/deepseek-v4.1-flash',
+    'openai-codex/gpt-6.1-sol',
+    'kimi-coding/k3-256k',
+  ]))
+check('S11 默认绑定全部 provider/model 非空', DEFAULT_QUICK_MODELS.every((e) =>
+  typeof e.provider === 'string' && e.provider.length > 0 && typeof e.model === 'string' && e.model.length > 0))
+
+check('S11 quickLabelOf 显式 label 优先', quickLabelOf({ provider: 'p', model: 'm', label: '我的' }) === '我的')
+check('S11 quickLabelOf 剥离常见前缀并截断', quickLabelOf({ provider: 'p', model: 'deepseek-v4.1-flash' }) === 'v4.1-flash'
+  && quickLabelOf({ provider: 'p', model: 'gpt-6.1-sol' }) === '6.1-sol'
+  && quickLabelOf({ provider: 'p', model: 'k3-256k' }) === 'k3-256k'
+  && quickLabelOf({ provider: 'p', model: 'providerlongname' }).length === QUICK_LABEL_MAX)
+check('S11 quickLabelOf 非法输入 → null', quickLabelOf(null) === null && quickLabelOf({}) === null
+  && quickLabelOf({ provider: 'p' }) === null && quickLabelOf({ provider: 'p', model: '' }) === null)
+
+check('S11 normalizeQuickModels 非数组 → null', normalizeQuickModels(null) === null
+  && normalizeQuickModels({}) === null && normalizeQuickModels('x') === null)
+check('S11 normalizeQuickModels 剔除非法项并保留合法项', (() => {
+  const out = normalizeQuickModels([
+    { provider: 'a', model: 'm1' },
+    { provider: '', model: 'm2' },
+    { provider: 'b', model: '' },
+    null,
+    { provider: 'c', model: 'm3', label: 42 },
+  ])
+  return out !== null && out.length === 2 && out[0].provider === 'a' && out[0].label === null
+    && out[1].provider === 'c' && out[1].label === null
+})())
+check('S11 normalizeQuickModels 截断到槽位上限', (() => {
+  const many = []
+  for (let i = 0; i < 12; i += 1) many.push({ provider: 'p' + i, model: 'm' + i })
+  const out = normalizeQuickModels(many)
+  return out !== null && out.length === QUICK_MAX_SLOTS
+})())
+check('S11 normalizeQuickModels 全非法 → null', normalizeQuickModels([null, {}, { provider: 'x' }]) === null)
+check('S11 normalizeQuickModels 不改写 provider（别名留给解析期）', (() => {
+  const out = normalizeQuickModels([{ provider: 'opencodego', model: 'deepseek-v4.1-flash' }])
+  return out !== null && out[0].provider === 'opencodego'
+})())
+check('S11 defaultQuickModels 深拷贝（改写不污染常量）', (() => {
+  const copy = defaultQuickModels()
+  copy[0].provider = 'mutated'
+  return DEFAULT_QUICK_MODELS[0].provider === 'ais-2dsglm'
+})())
+
+check('S11 loadQuickModels 无存储 → 默认且为深拷贝', (() => {
+  delete fakeLS.store[QUICK_STORAGE_KEY]
+  const first = loadQuickModels()
+  const same = JSON.stringify(first.map((e) => e.provider + '/' + e.model))
+    === JSON.stringify(DEFAULT_QUICK_MODELS.map((e) => e.provider + '/' + e.model))
+  first[0].provider = 'mutated'
+  const again = loadQuickModels()
+  return same && again[0].provider === 'ais-2dsglm'
+})())
+check('S11 loadQuickModels 损坏 JSON → 默认', (() => {
+  fakeLS.store[QUICK_STORAGE_KEY] = '{broken'
+  const out = loadQuickModels()
+  delete fakeLS.store[QUICK_STORAGE_KEY]
+  return out.length === DEFAULT_QUICK_MODELS.length && out[0].provider === DEFAULT_QUICK_MODELS[0].provider
+})())
+check('S11 loadQuickModels 有效存储 → 归一化结果', (() => {
+  fakeLS.store[QUICK_STORAGE_KEY] = JSON.stringify([{ provider: 'x', model: 'y', label: 'XY' }])
+  const out = loadQuickModels()
+  delete fakeLS.store[QUICK_STORAGE_KEY]
+  return out.length === 1 && out[0].provider === 'x' && out[0].label === 'XY'
+})())
+check('S11 saveQuickModels 写回可读 / 全非法时删键', (() => {
+  delete fakeLS.store[QUICK_STORAGE_KEY]
+  saveQuickModels([{ provider: 'x', model: 'y' }])
+  const wrote = typeof fakeLS.store[QUICK_STORAGE_KEY] === 'string'
+    && fakeLS.store[QUICK_STORAGE_KEY].includes('"provider":"x"')
+  saveQuickModels([{ provider: '' }])
+  const removed = fakeLS.store[QUICK_STORAGE_KEY] === undefined
+  delete fakeLS.store[QUICK_STORAGE_KEY]
+  return wrote && removed
+})())
+
+const quickState = {
+  status: 'ready',
+  current: { provider: 'ais-2dsglm', model: 'deepseek-v4.1-flash' },
+  groups: [
+    { id: 'ais-2dsglm', name: 'AIS 2DSGLM', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }, { id: 'glm-5.3-flash', name: 'GLM 5.3 Flash' }] },
+    { id: 'codex-relay', name: 'Codex (relay)', models: [{ id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol' }] },
+    { id: 'opencodego', name: 'OpenCode Go', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] },
+    { id: 'kimi-coding', name: 'Kimi For Coding', models: [{ id: 'k3-256k', name: 'K3 256K' }] },
+  ],
+}
+check('S11 quickStatusOf 命中 provider+model → 可点且当前项高亮', (() => {
+  const info = quickStatusOf({ provider: 'ais-2dsglm', model: 'deepseek-v4.1-flash' }, quickState)
+  return info.disabled === false && info.active === true && info.modelFound === true
+    && info.providerId === 'ais-2dsglm'
+    && info.title.includes('AIS 2DSGLM') && info.title.includes('DeepSeek V4.1 Flash')
+    && info.label === 'v4.1-flash'
+})())
+check('S11 quickStatusOf provider 缺失 → disabled 且 title 说明', (() => {
+  const info = quickStatusOf({ provider: 'openai-codex', model: 'gpt-6.1-sol' }, quickState)
+  return info.disabled === true && info.providerMissing === true && info.active === false
+    && info.title.includes('不在当前目录')
+})())
+check('S11 quickStatusOf provider 在但模型不在 → 仍可点（乐观切换）', (() => {
+  const info = quickStatusOf({ provider: 'codex-relay', model: 'gpt-9' }, quickState)
+  return info.disabled === false && info.modelFound === false
+    && info.title.includes('点击仍会尝试切换')
+})())
+check('S11 quickStatusOf 目录未就绪 → disabled', (() => {
+  const loading = { status: 'loading', current: null, groups: quickState.groups }
+  const info = quickStatusOf({ provider: 'ais-2dsglm', model: 'glm-5.3-flash' }, loading)
+  return info.ready === false && info.disabled === true && info.title.includes('尚未就绪')
+})())
+check('S11 quickStatusOf 别名命中：配置 opencode-go → 目录 opencodego', (() => {
+  const info = quickStatusOf({ provider: 'opencode-go', model: 'deepseek-v4.1-flash' }, quickState)
+  return info.providerId === 'opencodego' && info.disabled === false && info.group.id === 'opencodego'
+})())
+check('S11 quickStatusOf 反向别名：配置 opencodego → 目录 opencode-go', (() => {
+  const flipped = { status: 'ready', current: null, groups: [{ id: 'opencode-go', name: 'OpenCode Go', models: [{ id: 'deepseek-v4.1-flash' }] }] }
+  const info = quickStatusOf({ provider: 'opencodego', model: 'deepseek-v4.1-flash' }, flipped)
+  return info.providerId === 'opencode-go' && info.disabled === false
+})())
+
+/* 渲染：徽标左侧 6 个按钮 + 点击走官方 select */
+const quickSelectCalls = []
+const quickRenderState = {
+  status: 'ready',
+  current: { provider: 'ais-2dsglm', model: 'deepseek-v4.1-flash' },
+  groups: quickState.groups,
+}
+const quickRenderStore = { subscribe: () => () => {}, getSnapshot: () => quickRenderState }
+const quickRendered = renderComponent({
+  store: quickRenderStore,
+  load: () => {},
+  select: (selection) => { quickSelectCalls.push(selection); return Promise.resolve({ ok: true }) },
+})
+const quickNodes = quickNodesOf(quickRendered)
+check('S11 渲染：徽标左侧渲染 6 个常用模型按钮且顺序与默认一致',
+  quickRendered !== null && quickRendered.props['data-provider-badge-group'] === true
+  && quickNodes.length === 6
+  && quickNodes.map((n) => n.props['data-provider-badge-quick']).join(',') ===
+    'ais-2dsglm/deepseek-v4.1-flash,ais-2dsglm/glm-5.3-flash,codex-relay/gpt-6.1-sol,opencodego/deepseek-v4.1-flash,openai-codex/gpt-6.1-sol,kimi-coding/k3-256k')
+check('S11 渲染：按钮组位于徽标之前（同一分组容器内）', (() => {
+  const kids = quickRendered.props.children
+  if (!Array.isArray(kids)) return false
+  const barIndex = kids.findIndex((c) => c !== null && c !== undefined && c.props !== undefined && c.props['data-provider-badge-quickbar'] === true)
+  const badgeIndex = kids.findIndex((c) => c !== null && c !== undefined && c.props !== undefined && c.props['data-provider-badge-badge'] === true)
+  return barIndex >= 0 && badgeIndex === barIndex + 1
+})())
+check('S11 渲染：当前会话模型对应按钮标记为 active', (() => {
+  const actives = quickNodes.filter((n) => n.props['data-provider-badge-quick-active'] === true)
+  return actives.length === 1 && actives[0].props['data-provider-badge-quick'] === 'ais-2dsglm/deepseek-v4.1-flash'
+})())
+check('S11 渲染：provider 不在目录的按钮 disabled', (() => {
+  const node = quickNodes.find((n) => n.props['data-provider-badge-quick'] === 'openai-codex/gpt-6.1-sol')
+  return node !== undefined && node.props.disabled === true && node.props.title.includes('不在当前目录')
+})())
+check('S11 渲染：目录缺该模型但 provider 在 → 可点（乐观）', (() => {
+  const node = quickNodes.find((n) => n.props['data-provider-badge-quick'] === 'codex-relay/gpt-6.1-sol')
+  return node !== undefined && node.props.disabled === false
+})())
+check('S11 渲染：按钮底色走 provider 色表（opencodego 经别名取绿）', (() => {
+  const node = quickNodes.find((n) => n.props['data-provider-badge-quick'] === 'opencodego/deepseek-v4.1-flash')
+  return node !== undefined && node.props.style.background === ROUTE_COLORS['opencode-go']
+    && node.props.style.color === inkFor(ROUTE_COLORS['opencode-go'])
+})())
+await (async () => {
+  const before = quickSelectCalls.length
+  const node = quickNodes.find((n) => n.props['data-provider-badge-quick'] === 'codex-relay/gpt-6.1-sol')
+  node.props.onClick({ stopPropagation() {} })
+  await Promise.resolve()
+  const call = quickSelectCalls[quickSelectCalls.length - 1]
+  check('S11 点击按钮 → 调用官方 select（provider/model 用目录 id）',
+    quickSelectCalls.length === before + 1
+    && call.provider === 'codex-relay' && call.model === 'gpt-6.1-sol')
+})()
+await (async () => {
+  const before = quickSelectCalls.length
+  const node = quickNodes.find((n) => n.props['data-provider-badge-quick'] === 'openai-codex/gpt-6.1-sol')
+  node.props.onClick({ stopPropagation() {} })
+  await Promise.resolve()
+  check('S11 点击 disabled 按钮 → 不发起切换', quickSelectCalls.length === before)
+})()
+/* 配置视图的渲染形状（播种 quickConfigMode / assignSlot 两个 hook） */
+const QUICK_CONFIG_HOOK_INDEX = 11
+const ASSIGN_SLOT_HOOK_INDEX = 12
+const renderQuickConfig = () => {
+  stateSeeds.set(CASCADE_HOOK_INDEX, openCascadeSeed())
+  stateSeeds.set(ACTIVE_PROVIDER_HOOK_INDEX, 'ais-2dsglm')
+  stateSeeds.set(QUICK_CONFIG_HOOK_INDEX, true)
+  const render = renderComponent({ store: quickRenderStore, load: () => {}, select: () => Promise.resolve({ ok: true }) })
+  stateSeeds.clear()
+  const panels = panelsOf(Array.isArray(render) ? render[1] : null)
+  return { render, panels, rows: rowsOfPanel(panels[0]) }
+}
+check('S11 配置视图：槽位列表 6 行 + 返回/恢复默认，且不显示模型列', (() => {
+  const view = renderQuickConfig()
+  const flat = view.panels.length > 0 && Array.isArray(view.panels[0].props.children) ? view.panels[0].props.children : []
+  const slots = flat.filter((r) => r !== null && r !== undefined && r.props !== undefined && r.props['data-provider-badge-quick-slot'] !== undefined)
+  return view.panels.length === 1 && slots.length === 6
+    && actionOf(flat, 'data-provider-badge-quick-back') !== undefined
+    && actionOf(flat, 'data-provider-badge-quick-reset') !== undefined
+})())
+check('S11 配置视图：槽位行显示序号+文案+provider', (() => {
+  const view = renderQuickConfig()
+  const flat = view.panels.length > 0 && Array.isArray(view.panels[0].props.children) ? view.panels[0].props.children : []
+  const slot = flat.find((r) => r !== null && r !== undefined && r.props !== undefined && r.props['data-provider-badge-quick-slot'] === 0)
+  if (slot === undefined) return false
+  const kids = Array.isArray(slot.props.children) ? slot.props.children : []
+  const label = kids.find((c) => c !== null && c !== undefined && c.props !== undefined && c.props.key === 'label')
+  const provider = kids.find((c) => c !== null && c !== undefined && c.props !== undefined && c.props.key === 'provider')
+  return label !== undefined && textOfNode(label) === '1. v4.1-flash'
+    && provider !== undefined && textOfNode(provider) === 'ais-2dsglm'
+})())
+check('S11 指派模式：provider 列 + 指派提示行 + 模型列就位', (() => {
+  stateSeeds.set(CASCADE_HOOK_INDEX, openCascadeSeed())
+  stateSeeds.set(ACTIVE_PROVIDER_HOOK_INDEX, 'ais-2dsglm')
+  stateSeeds.set(QUICK_CONFIG_HOOK_INDEX, true)
+  stateSeeds.set(ASSIGN_SLOT_HOOK_INDEX, 0)
+  const render = renderComponent({ store: quickRenderStore, load: () => {}, select: () => Promise.resolve({ ok: true }) })
+  stateSeeds.clear()
+  const panels = panelsOf(Array.isArray(render) ? render[1] : null)
+  const rows = rowsOfPanel(panels[0])
+  const caption = actionOf(rows, 'data-provider-badge-quick-assign')
+  return panels.length === 2 && caption !== undefined && textOfNode(caption).includes('为按钮 1 选择模型')
+})())
+check('S11 源码：默认绑定集中声明（唯一改默认值入口）且存储键独立',
+  /const DEFAULT_QUICK_MODELS = \[/.test(source)
+  && /const QUICK_MAX_SLOTS = 6;/.test(source)
+  && source.includes('"dsh-plugin-provider-badge:quick-models"'))
+check('S11 源码：快捷按钮不写 settings、不碰凭据', !/credentials/.test(source)
+  && !/settings\.(set|write)/.test(source))
 
 /* ── 汇总 ─────────────────────────────────────────────────────────── */
 

@@ -179,6 +179,24 @@ window.__ModuleLoader__.load({
       return null;
     }
 
+    /* ── 常用模型快捷按钮：常量（唯一改默认值入口） ──────────────────── */
+
+    /** 槽位上限（= 默认条数）。改这里即可增减按钮数量上限。 */
+    const QUICK_MAX_SLOTS = 6;
+
+    /** localStorage 持久化键：常用模型绑定数组（JSON）。 */
+    const QUICK_STORAGE_KEY = "dsh-plugin-provider-badge:quick-models";
+
+    /** 默认 6 个常用模型绑定（用户指定初始值）。 */
+    const DEFAULT_QUICK_MODELS = [
+      { provider: "ais-2dsglm", model: "deepseek-v4.1-flash" },
+      { provider: "ais-2dsglm", model: "glm-5.3-flash" },
+      { provider: "codex-relay", model: "gpt-6.1-sol" },
+      { provider: "opencodego", model: "deepseek-v4.1-flash" },
+      { provider: "openai-codex", model: "gpt-6.1-sol" },
+      { provider: "kimi-coding", model: "k3-256k" },
+    ];
+
     /** localStorage 持久化键：路由 id → 用户所选底色（JSON 对象）。 */
     const STORAGE_KEY = "dsh-plugin-provider-badge:colors";
 
@@ -553,6 +571,144 @@ window.__ModuleLoader__.load({
         if (typeof localStorage === "undefined" || localStorage === null) return;
         localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
       } catch (_) { /* 隐私模式等：本次会话的内存覆盖仍有效 */ }
+    }
+
+    /* ── 纯函数：常用模型快捷按钮（配置归一化 + 状态解析） ───────────── */
+
+    /** 按钮文案截断上限。 */
+    const QUICK_LABEL_MAX = 10;
+
+    /** 模型 id 常见前缀（推导按钮文案时剥掉，避免窄按钮被前缀占满）。 */
+    const QUICK_LABEL_PREFIXES = ["deepseek-", "gpt-", "glm-", "kimi-", "claude-"];
+
+    /**
+     * 按钮文案：显式 `label` 优先；否则由模型 id 去掉常见前缀后截断到 10 字符。
+     * @param entry - 配置项（可含 label/provider/model）。
+     * @returns 文案或 null。
+     */
+    function quickLabelOf(entry) {
+      if (entry === null || typeof entry !== "object") return null;
+      if (typeof entry.label === "string" && entry.label.length > 0) return entry.label;
+      const modelId = typeof entry.model === "string" ? entry.model : "";
+      if (modelId.length === 0) return null;
+      let text = modelId;
+      for (const prefix of QUICK_LABEL_PREFIXES) {
+        if (text.startsWith(prefix) && text.length > prefix.length) { text = text.slice(prefix.length); break; }
+      }
+      return text.length > QUICK_LABEL_MAX ? text.slice(0, QUICK_LABEL_MAX) : text;
+    }
+
+    /**
+     * 配置数组归一化：剔除非法项（provider/model 必须非空字符串）、截断槽位上限。
+     * 非数组或全被剔除 → null（调用方据此回退默认）。
+     * @param raw - localStorage 读出的原始值。
+     * @returns 归一化数组或 null。
+     */
+    function normalizeQuickModels(raw) {
+      if (Array.isArray(raw) !== true) return null;
+      const out = [];
+      for (const item of raw) {
+        if (item === null || typeof item !== "object") continue;
+        const provider = typeof item.provider === "string" ? item.provider.trim() : "";
+        const model = typeof item.model === "string" ? item.model.trim() : "";
+        if (provider.length === 0 || model.length === 0) continue;
+        const label = typeof item.label === "string" && item.label.trim().length > 0 ? item.label.trim() : null;
+        out.push({ provider, model, label });
+        if (out.length >= QUICK_MAX_SLOTS) break;
+      }
+      return out.length > 0 ? out : null;
+    }
+
+    /** 默认绑定的深拷贝（调用方可安全改写，不污染常量）。 */
+    function defaultQuickModels() {
+      return DEFAULT_QUICK_MODELS.map((entry) => ({ provider: entry.provider, model: entry.model, label: null }));
+    }
+
+    /**
+     * 读取用户配置：存储不可用 / JSON 损坏 / 归一化后为空 → 回退默认。
+     * @returns 绑定数组（至少 1 项）。
+     */
+    function loadQuickModels() {
+      try {
+        if (typeof localStorage === "undefined" || localStorage === null) return defaultQuickModels();
+        const raw = localStorage.getItem(QUICK_STORAGE_KEY);
+        if (typeof raw !== "string" || raw.length === 0) return defaultQuickModels();
+        const normalized = normalizeQuickModels(JSON.parse(raw));
+        return normalized !== null ? normalized : defaultQuickModels();
+      } catch (_) {
+        return defaultQuickModels();
+      }
+    }
+
+    /**
+     * 落盘用户配置；归一化后为空时删除键（回到默认）。写失败静默忽略。
+     * @param list - 绑定数组。
+     */
+    function saveQuickModels(list) {
+      try {
+        if (typeof localStorage === "undefined" || localStorage === null) return;
+        const normalized = normalizeQuickModels(list);
+        if (normalized === null) localStorage.removeItem(QUICK_STORAGE_KEY);
+        else localStorage.setItem(QUICK_STORAGE_KEY, JSON.stringify(normalized));
+      } catch (_) { /* 隐私模式等：本次会话的内存态仍生效 */ }
+    }
+
+    /**
+     * 配置项 → 渲染与点击所需状态（纯函数，probe 直接断言）。
+     * 目录行先按 provider 精确匹配，未命中再按 `canonicalRouteId` 别名归一化匹配
+     * （本机 `opencodego` ↔ 通用 `opencode-go`）；返回的 `providerId` 恒为目录里的
+     * 真实 id —— 提交给官方 select 的必须是目录 id，不是配置里的写法。
+     * 判定：provider 缺失或目录未就绪 → disabled；provider 在而模型不在 → **仍可点**，
+     * 因为目录快照可能滞后于上游，且 select 自身会给出失败原因。
+     * @param entry - 配置项 {provider, model, label?}。
+     * @param state - 目录快照。
+     * @returns { group, providerId, modelId, model, label, active, providerMissing,
+     *   modelFound, ready, disabled, title }。
+     */
+    function quickStatusOf(entry, state) {
+      const binding = entry !== null && typeof entry === "object" ? entry : {};
+      const wanted = typeof binding.provider === "string" ? binding.provider : "";
+      const modelId = typeof binding.model === "string" ? binding.model : "";
+      const groups = state !== null && typeof state === "object" && Array.isArray(state.groups) ? state.groups : [];
+      const wantedCanonical = canonicalRouteId(wanted);
+      let group;
+      for (const row of groups) {
+        if (row === null || typeof row !== "object" || typeof row.id !== "string") continue;
+        if (row.id === wanted) { group = row; break; }
+        if (wantedCanonical !== null && canonicalRouteId(row.id) === wantedCanonical) { group = row; break; }
+      }
+      const status = state !== null && typeof state === "object" && typeof state.status === "string"
+        ? state.status : "idle";
+      const ready = status === "ready" || status === "selecting";
+      const providerId = group !== undefined && typeof group.id === "string" && group.id.length > 0
+        ? group.id : wanted;
+      const models = group !== undefined && Array.isArray(group.models) ? group.models : [];
+      const model = models.find((row) => row !== null && typeof row === "object" && row.id === modelId);
+      const current = state !== null && typeof state === "object"
+        && state.current !== null && typeof state.current === "object" ? state.current : null;
+      const active = current !== null && current.provider === providerId && current.model === modelId;
+      const providerMissing = group === undefined;
+      const providerName = group !== undefined && typeof group.name === "string" && group.name.length > 0
+        ? group.name : providerId;
+      const modelName = model !== undefined && typeof model.name === "string" && model.name.length > 0
+        ? model.name : modelId;
+      let title = "常用模型：" + providerName + " / " + modelName;
+      if (!ready) title += "（模型目录尚未就绪）";
+      else if (providerMissing) title += "（该 provider 不在当前目录）";
+      else if (model === undefined) title += "（该模型不在目录中，点击仍会尝试切换）";
+      return {
+        group,
+        providerId,
+        modelId,
+        model,
+        label: quickLabelOf(binding),
+        active,
+        providerMissing,
+        modelFound: model !== undefined,
+        ready,
+        disabled: !ready || providerMissing,
+        title,
+      };
     }
 
     /**
@@ -1048,6 +1204,13 @@ window.__ModuleLoader__.load({
       const [pendingSelection, setPendingSelection] = useState(null);
       // 额度：整表（路由 id → 条目）。lazy 初值直接读模块缓存，重开菜单即时可用。
       const [quotaRoutes, setQuotaRoutes] = useState(() => quotaCache.routes);
+      // 常用模型快捷按钮：绑定、配置视图、待指派槽位、行内错误、槽位光标。
+      // 新增 hook 一律追加在末尾——probe 用调用序号播种，既有 0..9 序号不得变化。
+      const [quickModels, setQuickModels] = useState(loadQuickModels);
+      const [quickConfigMode, setQuickConfigMode] = useState(false);
+      const [assignSlot, setAssignSlot] = useState(null);
+      const [quickError, setQuickError] = useState(null);
+      const [quickSlotIndex, setQuickSlotIndex] = useState(0);
       const keyBufferRef = useRef({ text: "", at: 0 });
       const badgeRef = useRef(null);
 
@@ -1091,6 +1254,9 @@ window.__ModuleLoader__.load({
         setLocalError(null);
         setActiveProviderId(null);
         setFocusLevel("providers");
+        setQuickConfigMode(false);
+        setAssignSlot(null);
+        setQuickError(null);
       };
 
       // 点 root（徽标/级联容器）以外的位置关闭所有弹层。
@@ -1185,6 +1351,8 @@ window.__ModuleLoader__.load({
         setLocalError(null);
         setActiveProviderId(null);
         setFocusLevel("providers");
+        setQuickConfigMode(false);
+        setAssignSlot(null);
       };
 
       const openCascade = (event) => {
@@ -1234,6 +1402,9 @@ window.__ModuleLoader__.load({
         } catch (_) { /* 无 DOM 环境不做定位；菜单落在 (0,0) 不影响逻辑 */ }
         setCascade(position);
         setColorMode(false);
+        setQuickConfigMode(false);
+        setAssignSlot(null);
+        setQuickError(null);
         setActiveProviderId(row !== undefined ? row.id : null);
         setProviderIndex(idx >= 0 ? idx : 0);
         setModelIndex(0);
@@ -1243,6 +1414,18 @@ window.__ModuleLoader__.load({
 
       const pickModel = (group, model) => {
         if (selecting || group === undefined || model === undefined) return;
+        // 配置模式：选中模型只写槽位，不切换会话选择（官方 select 零调用）。
+        if (assignSlot !== null) {
+          const next = quickModels.slice();
+          next[assignSlot] = { provider: group.id, model: model.id };
+          const normalized = normalizeQuickModels(next);
+          const applied = normalized !== null ? normalized : quickModels;
+          saveQuickModels(applied);
+          setQuickModels(applied);
+          setAssignSlot(null);
+          setLocalError(null);
+          return;
+        }
         const selection = selectionFor(group, model, state !== null && typeof state === "object" ? state.current : null);
         setLocalError(null);
         setPendingSelection(selection);
@@ -1283,6 +1466,52 @@ window.__ModuleLoader__.load({
         });
       };
 
+      /**
+       * 常用模型按钮：一键切换会话模型（与级联走同一条官方 select）。
+       * 失败只留在按钮行内的短标记 + title 里（级联通常是关闭的，面板内错误看不见）。
+       * @param entry - 配置项 {provider, model}。
+       */
+      const pickQuickModel = (entry) => {
+        if (selecting) return;
+        const info = quickStatusOf(entry, state);
+        setQuickError(null);
+        if (info.disabled) { setQuickError(info.title); return; }
+        const group = info.group !== undefined ? info.group : { id: info.providerId, models: [] };
+        const model = info.model !== undefined ? info.model : { id: info.modelId };
+        const selection = selectionFor(group, model, state !== null && typeof state === "object" ? state.current : null);
+        setPendingSelection(selection);
+        const fail = (message) => { setPendingSelection(null); setQuickError(message); setLocalError(message); };
+        const stateError = state !== null && typeof state === "object" && typeof state.error === "string" && state.error.length > 0
+          ? state.error : null;
+        let promise;
+        try {
+          promise = typeof face.select === "function"
+            ? face.select(selection)
+            : Promise.resolve({ ok: false, error: { code: "select/unavailable", message: "模型切换不可用" } });
+        } catch (err) {
+          fail(err !== null && typeof err === "object" && typeof err.message === "string" ? err.message : "模型切换失败");
+          return;
+        }
+        Promise.resolve(promise).then((result) => {
+          const ok = result === undefined || result === null ? true : result.ok !== false;
+          if (!ok) {
+            const err = result !== null && typeof result === "object" ? result.error : null;
+            if (err !== null && typeof err === "object" && err.code === "session/writer-held") {
+              fail("会话正被其他 DSH 占用");
+              return;
+            }
+            const message = err !== null && typeof err === "object" && typeof err.message === "string" && err.message.length > 0
+              ? err.message : stateError;
+            fail(message !== null ? message : "模型切换失败");
+            return;
+          }
+          setPendingSelection(null);
+          setQuickError(null);
+        }).catch((err) => {
+          fail(err !== null && typeof err === "object" && typeof err.message === "string" ? err.message : "模型切换失败");
+        });
+      };
+
       const onKeyDown = (event) => {
         if (event === null || typeof event !== "object") return;
         const key = event.key;
@@ -1299,13 +1528,24 @@ window.__ModuleLoader__.load({
         }
         if (key === "Escape") {
           consume();
-          if (colorMode) setColorMode(false);
+          if (assignSlot !== null) setAssignSlot(null);
+          else if (quickConfigMode) setQuickConfigMode(false);
+          else if (colorMode) setColorMode(false);
           else if (focusLevel === "models") setFocusLevel("providers");
           else closeCascade();
           return;
         }
         if (key === "Tab") return;
         if (colorMode) return;
+        // 槽位列表视图：方向键移光标、Enter 进入指派、其余可打印键不落到 provider typeahead。
+        if (quickConfigMode && assignSlot === null) {
+          const slots = Math.max(1, quickModels.length);
+          if (key === "ArrowDown") { consume(); setQuickSlotIndex((i) => (i + 1) % slots); }
+          else if (key === "ArrowUp") { consume(); setQuickSlotIndex((i) => (i - 1 + slots) % slots); }
+          else if (key === "Enter") { consume(); setAssignSlot(Math.min(quickSlotIndex, slots - 1)); }
+          else if (printable) consume();
+          return;
+        }
         const printable = typeof key === "string" && key.length === 1
           && !event.ctrlKey && !event.metaKey && !event.altKey;
         if (focusLevel === "providers") {
@@ -1380,8 +1620,90 @@ window.__ModuleLoader__.load({
         setColorMode(false);
       };
 
-      // 关闭态只渲染徽标本身（保持原有 span 形状与点击/键盘入口）。
-      if (cascade === null) return badgeEl;
+      /**
+       * 常用模型快捷按钮行：徽标左侧的 6 个一键切换胶囊。
+       * 颜色沿用 provider 色表（与徽标同源：aliasLookup 已抹平 opencodego/opencode-go），
+       * 当前命中项加描边，目录缺失/未就绪时 disabled 并把原因写进 title。
+       */
+      const quickButtonEls = quickModels.map((entry, index) => {
+        const info = quickStatusOf(entry, state);
+        const color = resolveColor(info.providerId, state, overrides);
+        const isPending = effectivePending !== null
+          && effectivePending.provider === info.providerId && effectivePending.model === info.modelId;
+        const style = {
+          display: "inline-flex",
+          alignItems: "center",
+          height: "16px",
+          padding: "0 5px",
+          borderRadius: "3px",
+          border: "none",
+          background: color,
+          color: inkFor(color),
+          fontWeight: 700,
+          fontSize: "9px",
+          lineHeight: "16px",
+          letterSpacing: "0",
+          userSelect: "none",
+          flex: "none",
+          boxSizing: "border-box",
+          opacity: info.disabled ? 0.45 : 1,
+          cursor: info.disabled || selecting ? "default" : "pointer",
+        };
+        if (info.active) {
+          style.outline = "1px solid currentColor";
+          style.outlineOffset = "1px";
+        }
+        if (isPending) style.opacity = 0.6;
+        return h("button", {
+          key: "quick:" + index,
+          type: "button",
+          "data-provider-badge-quick": info.providerId + "/" + info.modelId,
+          "data-provider-badge-quick-index": index,
+          "data-provider-badge-quick-active": info.active ? true : undefined,
+          "aria-label": info.title,
+          title: info.title,
+          disabled: info.disabled || selecting,
+          onClick: (event) => {
+            if (event !== null && typeof event === "object" && typeof event.stopPropagation === "function") {
+              event.stopPropagation();
+            }
+            pickQuickModel(entry);
+          },
+          style,
+        }, info.label !== null ? info.label : info.modelId);
+      });
+
+      const quickBarEl = quickModels.length === 0 ? null : h("span", {
+        key: "__quickbar",
+        "data-provider-badge-quickbar": true,
+        role: "group",
+        "aria-label": "常用模型快捷切换",
+        style: { display: "inline-flex", alignItems: "center", gap: "3px", flex: "none" },
+      }, ...quickButtonEls, quickError === null ? null : h("span", {
+        key: "__quick_error",
+        "data-provider-badge-quick-error": true,
+        title: quickError,
+        "aria-live": "polite",
+        style: {
+          marginLeft: "2px",
+          fontSize: "10px",
+          lineHeight: "16px",
+          fontWeight: 700,
+          color: "#ff9b9b",
+          flex: "none",
+        },
+      }, "!"));
+
+      // 分组容器：只要存在常用模型按钮，徽标就与按钮组包在同一个 inline-flex 里，
+      // 让按钮紧贴徽标左侧、作为一个 flex 项参与 composer 行的排布。
+      const groupEl = h("span", {
+        key: "__provider_badge_group",
+        "data-provider-badge-group": true,
+        style: { display: "inline-flex", alignItems: "center", gap: "3px", flex: "none" },
+      }, quickBarEl, badgeEl);
+
+      // 关闭态只渲染「按钮组 + 徽标」（无按钮时退化为只有徽标）。
+      if (cascade === null) return groupEl;
 
       const swatchDot = h("span", {
         key: "__color_dot",
@@ -1459,6 +1781,105 @@ window.__ModuleLoader__.load({
         providerPanel = h("div",
           { key: "__providers", role: "listbox", "aria-label": badge.title, style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px", maxHeight: panelMaxHeight + "px" } },
           backEl, gridEl, autoEl,
+        );
+      } else if (quickConfigMode && assignSlot === null) {
+        // 常用模型配置视图：槽位列表（点槽 → 进入指派，复用 provider/model 两级）。
+        const quickBackEl = h("button", {
+          type: "button",
+          key: "__quick_back",
+          "data-provider-badge-quick-back": true,
+          onClick: (event) => { stopIt(event); setQuickConfigMode(false); },
+          style: {
+            display: "flex",
+            alignItems: "center",
+            height: "30px",
+            padding: "0 8px",
+            border: "none",
+            background: "transparent",
+            color: "inherit",
+            font: "inherit",
+            fontSize: "12px",
+            letterSpacing: "0",
+            boxSizing: "border-box",
+            cursor: "pointer",
+          },
+        }, "‹ 返回");
+        const slotEls = quickModels.map((entry, index) => {
+          const info = quickStatusOf(entry, state);
+          const isActive = index === quickSlotIndex;
+          return h("button", {
+            type: "button",
+            key: "slot:" + index,
+            "data-provider-badge-quick-slot": index,
+            title: info.title,
+            onClick: (event) => {
+              stopIt(event);
+              setQuickSlotIndex(index);
+              setAssignSlot(index);
+              setFocusLevel("providers");
+              setLocalError(null);
+            },
+            style: {
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              width: "100%",
+              height: "30px",
+              padding: "0 8px",
+              border: "none",
+              borderRadius: "6px",
+              background: isActive ? "rgba(255, 255, 255, 0.10)" : "transparent",
+              color: info.disabled ? "rgba(255, 255, 255, 0.45)" : "inherit",
+              font: "inherit",
+              fontSize: "12px",
+              letterSpacing: "0",
+              boxSizing: "border-box",
+              cursor: "pointer",
+              textAlign: "left",
+            },
+          },
+          h("span", { key: "label", style: { flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+            (index + 1) + ". " + (info.label !== null ? info.label : info.modelId)),
+          h("span", { key: "provider", style: { flex: "none", fontSize: "10px", opacity: 0.62, whiteSpace: "nowrap" } }, info.providerId),
+          );
+        });
+        const quickResetEl = h("button", {
+          type: "button",
+          key: "__quick_reset",
+          "data-provider-badge-quick-reset": true,
+          onClick: (event) => {
+            stopIt(event);
+            const restored = defaultQuickModels();
+            saveQuickModels(restored);
+            setQuickModels(restored);
+            setQuickSlotIndex(0);
+            setAssignSlot(null);
+          },
+          style: {
+            display: "flex",
+            alignItems: "center",
+            width: "100%",
+            height: "30px",
+            marginTop: "4px",
+            padding: "0 8px",
+            border: "none",
+            borderTop: "1px solid rgba(255, 255, 255, 0.12)",
+            background: "transparent",
+            color: "inherit",
+            font: "inherit",
+            fontSize: "12px",
+            letterSpacing: "0",
+            boxSizing: "border-box",
+            cursor: "pointer",
+            textAlign: "left",
+          },
+        }, "恢复默认 6 项");
+        providerPanel = h("div",
+          { key: "__quick_slots", role: "listbox", "aria-label": "常用模型槽位", style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px", maxHeight: panelMaxHeight + "px" } },
+          quickBackEl,
+          ...slotEls,
+          quickResetEl,
         );
       } else {
         const providerRowEls = rows.map((row, index) => {
@@ -1581,6 +2002,52 @@ window.__ModuleLoader__.load({
         swatchDot,
         h("span", { key: "label", style: { flex: "1 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "徽标颜色…"),
         ));
+        // 一级底部：常用模型配置入口（指派模式下追加提示行）。
+        providerRowEls.push(h("button", {
+          type: "button",
+          key: "__quick_action",
+          "data-provider-badge-quick-action": true,
+          title: "配置徽标左侧的常用模型按钮",
+          onClick: (event) => {
+            stopIt(event);
+            setQuickConfigMode(true);
+            setColorMode(false);
+            setAssignSlot(null);
+            setQuickSlotIndex(0);
+          },
+          style: {
+            display: "flex",
+            alignItems: "center",
+            width: "100%",
+            height: "30px",
+            padding: "0 8px",
+            border: "none",
+            borderTop: "1px solid rgba(255, 255, 255, 0.12)",
+            background: "transparent",
+            color: "inherit",
+            font: "inherit",
+            fontSize: "12px",
+            letterSpacing: "0",
+            boxSizing: "border-box",
+            cursor: "pointer",
+            textAlign: "left",
+          },
+        },
+        h("span", { key: "label", style: { flex: "1 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "常用模型…"),
+        ));
+        if (assignSlot !== null) {
+          providerRowEls.unshift(h("div", {
+            key: "__quick_assign",
+            "data-provider-badge-quick-assign": assignSlot,
+            style: {
+              padding: "4px 8px",
+              fontSize: "11px",
+              lineHeight: "1.4",
+              letterSpacing: "0",
+              color: "rgba(255, 255, 255, 0.62)",
+            },
+          }, "为按钮 " + (assignSlot + 1) + " 选择模型 · Esc 取消"));
+        }
         providerPanel = h("div",
           { key: "__providers", role: "listbox", "aria-label": badge.title, style: { ...PANEL_BASE_STYLE, width: cascade.providerWidth + "px", maxHeight: panelMaxHeight + "px" } },
           providerRowEls,
@@ -1588,7 +2055,8 @@ window.__ModuleLoader__.load({
       }
 
       const panels = [providerPanel];
-      if (!colorMode && activeRow !== undefined && activeModels.length > 0) {
+      // 槽位列表视图只显示一列（模型列留给「指派模型」时用）。
+      if (!colorMode && !(quickConfigMode && assignSlot === null) && activeRow !== undefined && activeModels.length > 0) {
         const modelRowEls = activeModels.map((model, index) => {
           const isCurrent = currentProviderId === activeRow.id && currentModelId === model.id;
           const isActive = index === modelIndex;
@@ -1658,7 +2126,7 @@ window.__ModuleLoader__.load({
         ? createPortal(cascadeEl, portalTarget)
         : cascadeEl;
 
-      return [badgeEl, cascadeTree];
+      return [groupEl, cascadeTree];
     }
 
     /* ── 跨插件只读展示桥（sidebar 运行行取模型配色） ─────────────────── */
@@ -1865,6 +2333,8 @@ window.__ModuleLoader__.load({
       colorOf, resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
       badgeOf, faceOf, UNAVAILABLE, presentationOf,
       BRIDGE_GLOBAL, BRIDGE_EVENT, BRIDGE_VERSION, colorPresentationFor,
+      QUICK_MAX_SLOTS, QUICK_STORAGE_KEY, DEFAULT_QUICK_MODELS, QUICK_LABEL_MAX,
+      quickLabelOf, normalizeQuickModels, defaultQuickModels, loadQuickModels, saveQuickModels, quickStatusOf,
       selectionFor, cascadePlacementFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
       shouldCloseOnScroll,
       QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,

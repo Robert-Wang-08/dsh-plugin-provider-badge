@@ -1,6 +1,6 @@
 # dsh-plugin-provider-badge 说明
 
-DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会话输入区的「模型及推理等级」选择器正前方渲染一个 **provider 徽标**，并在点开的 provider 级联菜单里为支持的路由显示 **可用额度**（当前为 OpenAI Codex、Kimi、OpenCode Go 三家的窗口用量）。本轮实现与探针基于宿主 `0.2.0-rc.2`。
+DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会话输入区的「模型及推理等级」选择器正前方渲染一个 **provider 徽标**，并在徽标左侧渲染 **6 个可配置的常用模型一键切换按钮**，并在点开的 provider 级联菜单里为支持的路由显示 **可用额度**（当前为 OpenAI Codex、Kimi、OpenCode Go 三家的窗口用量）。本轮实现与探针基于宿主 `0.2.0-rc.2`。
 
 实际渲染（composer 右下角，绿色 `opengo` 徽标 + 模型选择器）：
 
@@ -34,6 +34,8 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 | 跟随 | 数据来自官方共享目录 store（`ctx.modelDirectories`，与模型席位/`/model` 弹层同源），会话内切换模型/路由即时跟随 |
 | 额度 | 宿主半的 `GET /provider-badge/quota` 报告可用额度时，在该 provider 行右侧渲染 `5h 4% · 7d 35% · 重置 3h29m`（**已用**百分比 + 最紧窗口剩余重置时间，10px、tabular-nums、不收缩），悬停显示每个窗口的完整倒计时：`5h 已用 4%，3h29m后重置 · 7d 已用 35%，5d6h后重置 · 套餐 plus`（有额外余额时追加余额）。窗口标签按窗口**时长**判定（18000→`5h`、604800→`7d`、2592000→`30d`），不按上游 primary/secondary 角色，也**不限窗口个数**；数值 ≥70% 转琥珀、≥90% 或已达上限转红（按最紧的窗口定级）。取数在**打开级联时**触发（客户端缓存 25s、宿主上游缓存 60s）；认证失效显示 `额度需登录`，未配置显示 `额度未配置`，其它上游失败显示 `额度不可用`，均不影响模型选择。已接入数据源：`openai-codex`（5h/7d，含套餐名）、`kimi-coding`（5h/7d + 账单段）、`opencode-go`（5h/7d/30d 三窗口）；浏览器半按行 id 命中整表条目 |
 | 账单段 | 条目带 `extraUsage`（当前只有 Kimi）时，悬停说明**末尾**追加 `本月已用 ¥0.00 · 月度上限 Unlimited · 加购余额 ¥32.77`；钱包状态非 `STATUS_ACTIVE` 时余额后标注（如 `（钱包已停用 STATUS_DISABLED）`）。**只进悬停说明**，行内文本与列宽零影响；`extraUsage` 缺失或字段不全时该段整体不出现 |
+| 常用模型按钮 | 徽标**左侧**渲染最多 6 个一键切换胶囊（同一 `conversation.input.right` 席位，与徽标同处一个 inline-flex 分组），默认 6 项：`ais-2dsglm/deepseek-v4.1-flash`、`ais-2dsglm/glm-5.3-flash`、`codex-relay/gpt-6.1-sol`、`opencodego/deepseek-v4.1-flash`、`openai-codex/gpt-6.1-sol`、`kimi-coding/k3-256k`。底色走 provider 色表（含 `opencodego`/`opencode-go` 别名归一，字色 `inkFor`），当前会话选择项加描边；**单击即切换**，与级联/官方模型席位走同一条 `ModelDirectory.select`（不新增请求、不写 settings）。判定：provider 不在目录或目录未就绪 → `disabled` 并把原因写进 title；provider 在但模型不在目录 → **仍可点**（乐观切换，失败原因回报在按钮行尾的 `!` 与 title）。上限与默认值集中在 `client.js` 的 `QUICK_MAX_SLOTS` / `DEFAULT_QUICK_MODELS` |
+| 常用模型配置 | 级联一级底部「常用模型…」进入槽位列表（6 行，显示序号 + 模型文案 + provider），点槽位即进入**指派模式**（复用同一套 provider/model 两级列，`Esc` 取消），选中模型只写槽位、不切换会话；「恢复默认 6 项」一键回到默认绑定。配置写入 `localStorage` 键 `dsh-plugin-provider-badge:quick-models`（JSON 数组），损坏/缺失自动回退默认；槽位列表内 `ArrowUp`/`ArrowDown` 移光标、`Enter` 进入指派 |
 | 降级 | subagent 转址会话、`modelDirectories` 未装载、目录解析抛错、无当前选择 → 渲染为空，不报错不占位；额度端点不可达时不渲染，端点返回路由级 `ok:false` 时显示脱敏短状态（需登录 / 未配置 / 不可用），其余行为零变化 |
 
 ## 跨插件只读桥（侧栏运行行取模型配色）
@@ -57,7 +59,7 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 ## 明确非目标
 
 - **不反映运行期故障转移重路由**：分档切换对 UI 透明是既有设计；徽标与官方模型席位同口径，反映**会话选择**的 provider。
-- 不写 settings、不持凭据、不发起任何变更类请求；唯一本地写入是 `localStorage` 选色（每路由可恢复自动配色）。
+- 不写 settings、不持凭据、不发起任何变更类请求；本地写入只有两条 `localStorage`：选色（`…:colors`，每路由可恢复自动配色）与常用模型绑定（`…:quick-models`）。常用模型按钮切换模型时走的是官方 `select`，与本插件零状态耦合。
 - **额度只读，且不代管凭据**：宿主半读 `llm-pi-ai` 拥有的凭据记录或该路由生效的 `apiKeyEnv` 引用，只做一次只读 GET，**不刷新、不写回、不落盘、不写日志**；令牌临期/过期时直接放弃本次查询（`token-expired`），把刷新留给 pi-ai —— 两处并发刷新会互相作废对方的 refresh token（凭据服务的 `modifyRecord` 就是为此串行化）。额度失败只显示固定的脱敏短状态，不显示上游响应体、账号或凭据。同理**不读 Kimi CLI 的 `~/.kimi-code/credentials/kimi-code.json`**：那份 OAuth 令牌实测 401，且刷新它会与 Kimi CLI 抢同一份 refresh token。
 - 额度**不改变预算/计费口径**：窗口显示的是上游报告的**已用百分比**，不是本机 token 计费估算；两者不可互相换算。Kimi 悬停里的账单段（本月已用 / 月度上限 / 加购余额）确实是**钱**，但它同样是上游直接给的字段（本插件不折算、不估算）；若钱包未启用，它显示 `Unlimited` 而不是编一个上限。OpenCode Go 尤其要注意：官方是按**模型**给月度美元上限（$15/$30/$60/$80 不等），而 `/usage` 只回**订阅级**三个窗口的百分比 —— 本插件显示的是后者，**不做按模型的美元换算**，也不显示「哪个模型还剩多少」。
 - 不遮蔽任何官方席位；官方模型选择器行为零改变。级联的模型读取与提交复用官方共享目录**同一个 `ctx.modelDirectories.directoryFor(sessionId)`**（`store`/`load`/`select` 同源，官方同口径 `selectionOf`），不新增 RPC、不写 settings，官方 `/model` 弹窗与 composer 模型席位零改变。
@@ -128,7 +130,7 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 ## 验证
 
 ```powershell
-node probe/smoke-client.mjs   # 交付形状 + 推导/颜色 + face 降级 + 级联/额度纯函数与渲染（期望 ALL PASSED）
+node probe/smoke-client.mjs   # 交付形状 + 推导/颜色 + face 降级 + 级联/额度 + 常用模型按钮（期望 ALL PASSED）
 node probe/smoke-host.mjs     # 宿主半：窗口校验 + 三条数据源口径 + 凭据只读/降级（grant & ref）+ 缓存单飞 + 端点行为（期望 ALL PASSED）
 node --check client.js; node --check index.js
 ```
@@ -150,6 +152,8 @@ node --check client.js; node --check index.js
 11. **额度（Kimi）**：`kimi-coding` 行右侧出现 `5h x% · 7d y%`（**不会**有三个窗口），悬停 title 除窗口外还有账单段 `本月已用 ¥0.00 · 月度上限 Unlimited · 加购余额 ¥32.77（钱包已停用 STATUS_DISABLED）`（数值随账号变化；`月度上限` 在未启用时是 `Unlimited`）；把该路由的 `apiKeyEnv` 临时指向一个不存在的引用后重开菜单，额度消失且无任何错误提示；
 12. **额度（OpenCode Go）**：**本机该行 id 是 `opencodego`**（另一台设备是 `opencode-go`），右侧同样出现 `5h x% · 7d y% · 30d z%` 三个窗口（比另两行宽），且 provider 列宽已放到 260px、显示名没被挤没；悬停 title 三个窗口各自带倒计时、无「套餐」段；数值与 [console](https://opencode.ai/console) 的用量一致（凭据取自该路由自己配置的 `OPENCODEGO_API_KEY`，不是回退名）；徽标本身也命中草绿 `#7CB342` 与 `opengo` 缩写；
 13. **额度降级**：未配置凭据（或令牌已过期）时不显示额度且**不出现任何错误提示**；打开一次浏览器 DevTools Network 面板，确认 `GET /provider-badge/quota` 在 25s 内重复开菜单时不再发第二次请求，且响应体里搜不到任何令牌片段。
+14. **常用模型按钮**：徽标**左侧**出现 6 个窄胶囊（默认依次为 `v4.1-flash` / `5.3-flash` / `6.1-sol` / `v4.1-flash` / `6.1-sol` / `k3-256k`），颜色与对应 provider 徽标同源，当前会话选择那颗带描边；鼠标悬停显示 `常用模型：<provider 名> / <模型名>`；点击立刻切换（不弹菜单、不改徽标以外的任何 UI）；切到 `openai-codex/gpt-6.1-sol` 或 `kimi-coding/k3-256k` 时若本机目录没有该 provider，该按钮为半透明不可点，title 追加 `（该 provider 不在当前目录）`；**目录里缺某个模型但 provider 在**时按钮仍可点（乐观切换），失败只在行尾出现红色 `!` 且悬停给出原因。
+15. **常用模型配置**：点徽标 → 一级底部「常用模型…」→ 槽位列表（6 行，序号 + 模型文案 + provider）；点第 3 槽 → 进入 provider 列表并在顶部显示 `为按钮 3 选择模型 · Esc 取消`，选 provider → 模型即完成指派（**不会**切换当前会话模型）；`Esc` 逐级退出（指派 → 槽位列表 → 级联）；「恢复默认 6 项」回到出厂绑定；刷新页面后自定义绑定仍在（`localStorage` 键 `dsh-plugin-provider-badge:quick-models`），手动把该键改成 `{broken` 后刷新，按钮回退默认 6 项且不报错。
 
 
 ## 实现备注
