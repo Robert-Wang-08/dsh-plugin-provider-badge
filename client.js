@@ -132,6 +132,53 @@ window.__ModuleLoader__.load({
       "kimi-coding": "kimi官",
     };
 
+    /**
+     * 路由别名表：同一家 provider 在不同设备/profile 里 id 不同（本机 OpenCode Go
+     * 注册为 `opencodego`，上游与另一台设备写 `opencode-go`）。查 Color/Label 表与
+     * 额度条目时先按原 id 精确命中，未命中再按别名归一化的 id 兜一次，避免命名
+     * 差异导致丢色、丢缩写、丢额度。
+     */
+    const ROUTE_ALIASES = Object.freeze({ opencodego: "opencode-go" });
+
+    /** 路由 id → 别名归一化后的 id；未入表原样返回，非字符串/空 → null。 */
+    function canonicalRouteId(routeId) {
+      if (typeof routeId !== "string" || routeId.length === 0) return null;
+      return Object.prototype.hasOwnProperty.call(ROUTE_ALIASES, routeId) ? ROUTE_ALIASES[routeId] : routeId;
+    }
+
+    /**
+     * 查表（ROUTE_COLORS / ROUTE_LABELS / 额度整表）：原 id 精确优先，未命中再按别名。
+     * @param table - 普通对象（不是 Map）。
+     * @param routeId - provider 路由 id。
+     * @returns 命中的值或 null。
+     */
+    function aliasLookup(table, routeId) {
+      if (table === null || typeof table !== "object") return null;
+      if (Object.prototype.hasOwnProperty.call(table, routeId)) return table[routeId];
+      const canonical = canonicalRouteId(routeId);
+      if (canonical !== null && Object.prototype.hasOwnProperty.call(table, canonical)) return table[canonical];
+      return null;
+    }
+
+    /**
+     * 额度整表取值：原 id 精确 → 别名归一化 → 反向别名（表里的键是别名、行 id 是
+     * 规范名时也要能命中；两台设备可能各报一个名字）。
+     * @param routes - 宿主返回的 `routes` 整表（可空）。
+     * @param routeId - 行 id。
+     * @returns 条目或 null。
+     */
+    function quotaEntryFor(routes, routeId) {
+      const direct = aliasLookup(routes, routeId);
+      if (direct !== null) return direct;
+      if (routes === null || typeof routes !== "object") return null;
+      const canonical = canonicalRouteId(routeId);
+      if (canonical === null) return null;
+      for (const key of Object.keys(routes)) {
+        if (canonicalRouteId(key) === canonical) return routes[key];
+      }
+      return null;
+    }
+
     /** localStorage 持久化键：路由 id → 用户所选底色（JSON 对象）。 */
     const STORAGE_KEY = "dsh-plugin-provider-badge:colors";
 
@@ -468,9 +515,8 @@ window.__ModuleLoader__.load({
      * 哈希回退调色板（未入表路由的槽位分配不变）。
      */
     function colorOf(routeId, state) {
-      if (typeof routeId === "string" && Object.prototype.hasOwnProperty.call(ROUTE_COLORS, routeId)) {
-        return ROUTE_COLORS[routeId];
-      }
+      const tabled = typeof routeId === "string" ? aliasLookup(ROUTE_COLORS, routeId) : null;
+      if (tabled !== null) return tabled;
       const slots = hueSlotsFor(routeIdsOf(state));
       const slot = slots.get(routeId);
       return PALETTE[slot !== undefined ? slot : hash32(routeId) % PALETTE.length];
@@ -824,8 +870,7 @@ window.__ModuleLoader__.load({
         );
         if (group !== undefined) displayName = group.name;
       }
-      const override = Object.prototype.hasOwnProperty.call(ROUTE_LABELS, routeId)
-        ? ROUTE_LABELS[routeId] : null;
+      const override = aliasLookup(ROUTE_LABELS, routeId);
       const text = override !== null ? override : deriveLetters(displayName, routeId);
       if (text === null) return null;
       const title = displayName !== null ? displayName + " (" + routeId + ")" : routeId;
@@ -1440,8 +1485,9 @@ window.__ModuleLoader__.load({
           if (isPending) trailing = "…";
           // 额度：只对宿主报告了可用条目的路由渲染。本半不认识具体 provider：
           // 命中 row.id 即可渲染（openai-codex / kimi-coding 走同一段代码）。
-          const quotaEntry = quotaRoutes !== null && typeof quotaRoutes === "object"
-            && Object.prototype.hasOwnProperty.call(quotaRoutes, row.id) ? quotaRoutes[row.id] : null;
+          // 宿主按 baseURL 判定真实路由 id（本机 opencodego），但旧版本/另一台设备只会
+          // 给规范名（opencode-go）：精确 → 别名 → 反向别名三层兜底。
+          const quotaEntry = quotaEntryFor(quotaRoutes, row.id);
           const quotaFailure = quotaFailureOf(quotaEntry);
           const quotaSuccessText = quotaInlineTextOf(quotaEntry);
           const quotaText = quotaSuccessText !== null ? quotaSuccessText
@@ -1730,8 +1776,7 @@ window.__ModuleLoader__.load({
         status: "ready",
       };
       const color = resolveColor(providerId, state, loadOverrides());
-      const label = Object.prototype.hasOwnProperty.call(ROUTE_LABELS, providerId)
-        ? ROUTE_LABELS[providerId] : null;
+      const label = aliasLookup(ROUTE_LABELS, providerId);
       const text = label !== null ? label : deriveLetters(providerId, providerId);
       if (text === null) return null;
       return Object.freeze({
@@ -1815,6 +1860,7 @@ window.__ModuleLoader__.load({
     /** probe 专用面：纯函数与 face 出厂的行为断言（不构成任何运行时承诺）。 */
     const __test = {
       fourLetters, deriveLetters, hash32, ROUTE_COLORS, ROUTE_LABELS, STORAGE_KEY, PALETTE,
+      ROUTE_ALIASES, canonicalRouteId, aliasLookup, quotaEntryFor,
       parseColor, relativeLuminance, inkFor, wheelDist, hueSlotsFor, routeIdsOf,
       colorOf, resolveColor, swatchColors, panelPositionFor, loadOverrides, saveOverrides,
       badgeOf, faceOf, UNAVAILABLE, presentationOf,

@@ -90,15 +90,15 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 | --- | --- | --- | --- |
 | `openai-codex` | `https://chatgpt.com/backend-api/wham/usage` | 宿主凭据记录 `llm-pi-ai/openai-codex`（`kind: grant`，payload `{type:'oauth',access,refresh,expires,accountId}`） | `chatgpt-account-id: <accountId>`、`originator: pi`（与 pi-ai 的 Codex 适配器同口径） |
 | `kimi-coding` | `https://api.kimi.com/coding/v1/usages` | settings `llm-pi-ai.providers['kimi-coding'].apiKeyEnv` 指向的凭据引用（本机在 profile 的 `cordis.patch.yml` 里声明为 `LLMKEY_KIMI`，runtime 由 `settings.describe()` 暴露），取不到时回退 `KIMI_API_KEY` | 无（只发 `authorization` / `accept`） |
-| `opencode-go` | `https://opencode.ai/zen/go/v1/usage`（当前 OpenCode CLI 从模型 API URL 推导出的 usage 路径） | settings `llm-pi-ai.providers['opencode-go'].apiKeyEnv` 指向的凭据引用（本机为 `OPENCODE_API_KEY`），取不到时回退 `OPENCODE_API_KEY` | 无（只发 `authorization` / `accept`） |
+| `opencode-go` | `https://opencode.ai/zen/go/v1/usage`（当前 OpenCode CLI 从模型 API URL 推导出的 usage 路径） | **按 baseURL 判定本机真实路由 id**：settings `llm-pi-ai.providers[<命中 baseURL 含 `opencode.ai/zen/go` 的那个 id>].apiKeyEnv`（本机该 id 是 `opencodego`，引用 `OPENCODEGO_API_KEY`）；取不到时依次回退 `OPENCODE_API_KEY` → `OPENCODEGO_API_KEY` | 无（只发 `authorization` / `accept`） |
 
 ### 端点契约
 
 | 项 | 值 |
 | --- | --- |
-| 响应 | `{ ok, updatedAt, routes: { <routeId>: <entry> } }`；`<entry>` 形如 `{ok, plan, limitReached, windows:[{windowSeconds,usedPercent,resetsAt,resetAfterSeconds}], credits, fetchedAt}`，失败为 `{ok:false, reason}`，`reason ∈ {unsupported, credentials-unavailable, credentials-error, not-configured, token-expired, network, http-<code>, bad-json, no-windows, unexpected}` |
+| 响应 | `{ ok, updatedAt, routes: { <routeId>: <entry> } }`；`<routeId>` 同时包含**规范名**（`openai-codex` / `kimi-coding` / `opencode-go`）与 **settings 里 baseURL 命中的真实 id**（本机 `opencodego`），两者指向同一份条目——设备间命名差异不影响浏览器半按 `row.id` 命中；`<entry>` 形如 `{ok, plan, limitReached, windows:[{windowSeconds,usedPercent,resetsAt,resetAfterSeconds}], credits, fetchedAt}`，失败为 `{ok:false, reason}`，`reason ∈ {unsupported, credentials-unavailable, credentials-error, not-configured, token-expired, network, http-<code>, bad-json, no-windows, unexpected}` |
 | 可选字段 | Kimi 条目另带 `extraUsage: {totalCents, balanceCents, monthlyUsedCents, monthlyChargeLimitCents, monthlyChargeLimitEnabled, currency, status}`（账单口径，只进悬停说明）或 `null`；其它数据源不带该字段。账单对象**刻意不含钱包 id / userId** |
-| 缓存 | 宿主侧 60s（并单飞合并并发请求）、客户端侧 25s；收到 `credentials/record-updated` 时立刻失效对应路由缓存 |
+| 缓存 | 宿主侧 60s、按**数据源**记账（同一数据源被多个路由 id 共用也只打一次上游），并单飞合并并发请求；客户端侧 25s；收到 `credentials/record-updated` 时立刻失效对应数据源缓存 |
 | 安全 | 端点只应答回环请求（非回环 403、非 GET 405）；上游非 200 只回状态码不回响应体；任何响应都不含令牌、邮箱、账号 id |
 
 ### 各数据源的口径
@@ -148,7 +148,7 @@ node --check client.js; node --check index.js
 9. 手动触发一次故障转移后徽标仍显示会话选择的路由（非目标确认）；
 10. **额度（Codex）**：当前会话路由为 `openai-codex` 时打开级联，该行右侧出现 `5h x% · 7d y%`，数值与 Codex 自身 `/status` 一致；悬停 title 含重置倒计时与套餐名；
 11. **额度（Kimi）**：`kimi-coding` 行右侧出现 `5h x% · 7d y%`（**不会**有三个窗口），悬停 title 除窗口外还有账单段 `本月已用 ¥0.00 · 月度上限 Unlimited · 加购余额 ¥32.77（钱包已停用 STATUS_DISABLED）`（数值随账号变化；`月度上限` 在未启用时是 `Unlimited`）；把该路由的 `apiKeyEnv` 临时指向一个不存在的引用后重开菜单，额度消失且无任何错误提示；
-12. **额度（OpenCode Go）**：`opencode-go` 行右侧出现 `5h x% · 7d y% · 30d z%` 三个窗口（比另两行宽），且 provider 列宽已放到 260px、显示名没被挤没；悬停 title 三个窗口各自带倒计时、无「套餐」段；数值与 [console](https://opencode.ai/console) 的用量一致；
+12. **额度（OpenCode Go）**：**本机该行 id 是 `opencodego`**（另一台设备是 `opencode-go`），右侧同样出现 `5h x% · 7d y% · 30d z%` 三个窗口（比另两行宽），且 provider 列宽已放到 260px、显示名没被挤没；悬停 title 三个窗口各自带倒计时、无「套餐」段；数值与 [console](https://opencode.ai/console) 的用量一致（凭据取自该路由自己配置的 `OPENCODEGO_API_KEY`，不是回退名）；徽标本身也命中草绿 `#7CB342` 与 `opengo` 缩写；
 13. **额度降级**：未配置凭据（或令牌已过期）时不显示额度且**不出现任何错误提示**；打开一次浏览器 DevTools Network 面板，确认 `GET /provider-badge/quota` 在 25s 内重复开菜单时不再发第二次请求，且响应体里搜不到任何令牌片段。
 
 
@@ -156,7 +156,8 @@ node --check client.js; node --check index.js
 
 - **cordis 注入权限模型（踩过一次的坑）**：插件 `exports.inject` 决定 apply 作用域能访问的服务树；本插件需 `["slots", "sessions", "modelDirectories", "remote", "remote.session"]` —— 缺 `remote`/`remote.session` 时 `modelDirectories.directoryFor()` 内部访问 `this.ctx.remote.session` 会抛 `cannot get property "remote.session" without inject`，且被降级路径吞掉表现为「无报错 + 无徽标」。先例：官方 model-selection 的 inject 同样声明 `remote`/`remote.session`。宿主半不声明 `inject` 导出，改用 `ctx.inject(['webServer'], …)` 动态挂载（无 `webServer` 的 profile 自动跳过额度端点，其余能力不受影响）。
 - **provider 列宽 176 → 200 → 260**：额度文案常驻该行右侧，176px 下显示名只剩 60 余像素；接 OpenCode Go 的三窗口文案（`5h 6% · 7d 36% · 30d 59%`，约 25 字符）后 200px 也不够，故放到 260px。列宽在 `CASCADE_PROVIDER_WIDTH` 与 `cascadePlacementFor` 的默认参数两处同值（探针 `smoke-client.mjs` 的 `PROVIDER_WIDTH` 是第三处，改一处要三处同改）；极窄视口仍走收窄分支（provider 最窄 132px）。行内 `name` span 同时补了 `minWidth: 0` + `flex: 1 1 auto`，长显示名会省略号让位而不是把额度挤出列宽。
-- **额度数据源表驱动（三家共用同一条路径）**：`QUOTA_SOURCES` 每项只声明 `auth`（`grant` 读凭据记录 / `ref` 读 settings 里该路由生效的 `apiKeyEnv`，可带回退引用名）、`url`、`headers(auth)`、`parse(payload, now)`；服务层只剩「解析凭据 → 一次 GET → 解析响应」三步，缓存 / 单飞 / 降级 / 端点全部与数据源无关，浏览器半按 `row.id` 命中整表且**不限窗口个数**。OpenCode Go 是这套设计的第一次「零客户端改动」验证：只加了表里一条 + 一个 `parse` 函数，`client.js` 唯一的改动是把列宽从 200 调到 260。
+- **路由 id 因设备而异 → 按 baseURL 判定 + 别名（2026-10-23 修）**：同一家 provider 在不同设备/profile 里可能注册成不同 id（本机 OpenCode Go 是 `opencodego`，上游与另一台设备写 `opencode-go`）。宿主半因此不再用 id 精确匹配数据源：`QUOTA_SOURCES` 每项新增 `routeMatch: { baseHosts, aliases }`，`routeIdsFor()` 先取别名、再扫描 settings 里 `baseURL` 含 `baseHosts` 的 provider，命中的**真实 id** 才用来解析 `apiKeyEnv`（否则回退引用名会顶替路由真正配置的 key，可能读到另一账号的百分比）；`readAll()` 把同一份条目同时写给规范名与真实 id。浏览器半对已知差异有 `ROUTE_ALIASES`（`opencodego → opencode-go`），缩写表 / 色表 / 额度整表查询都走「精确 → 别名 → 反向别名」，因此**两侧任意一侧命名不同都能对上**。判据证据：本机 `routeIdsFor('opencode-go') = ['opencode-go','opencodego']`，端点键含 `opencodego`，凭据解析命中 `OPENCODEGO_API_KEY`。
+- **额度数据源表驱动（三家共用同一条路径）**：`QUOTA_SOURCES` 每项只声明 `routeMatch`（`baseHosts` / `aliases`）、`auth`（`grant` 读凭据记录 / `ref` 读 settings 里该路由生效的 `apiKeyEnv`，可带回退引用名）、`url`、`headers(auth)`、`parse(payload, now)`；服务层只剩「解析凭据 → 一次 GET → 解析响应」三步，缓存 / 单飞 / 降级 / 端点全部与数据源无关，浏览器半按 `row.id` 命中整表且**不限窗口个数**。OpenCode Go 是这套设计的第一次「零客户端改动」验证：只加了表里一条 + 一个 `parse` 函数，`client.js` 唯一的改动是把列宽从 200 调到 260。
 - **额度渲染对用户不可见地降级**：`ok:false` 的条目一律不渲染（与「不报错不占位」同口径）；探针 `smoke-client.mjs` 用「按 `useState` 调用序号播种」的假 react 钩子（`renderComponent` + `stateSeeds`）把「级联已打开」这一交互态直接摆到渲染函数前面，因此级联渲染路径有真实断言而非只看源码形状；播种序号即组件内 `useState` 顺序，顺序一变该断言立即失败。
 - **Kimi 账单口径的证据来源**：`kimi.exe` 是 Node SEA，内嵌明文 JS。用 `rg -a` 抽出 `parseBoosterWallet` / `fixedPointToCents` / `buildExtraUsageSection` / `formatCurrencyParts` 后按它的换算与判据实现（`1e6` 定点、不足 1 分算 1 分、`type === 'BOOSTER'` 且 `amount > 0`、`enabled && 上限 > 0` 才算有上限）。这是本插件第一次「照抄上游客户端语义」，所以两处刻意不同都写进了注释与本文档：**（1）** 多带 `status` 供客户端标注停用；**（2）** 不把账单当窗口，只进悬停说明。
 - 交付为手写 CJS + `window.__ModuleLoader__.load({id, factory})` 包装的 classic script（先例：`dsh-deepseek-keypool/client.js`）；**任何模块级 import/export 会炸掉整个 `/plugins` combo**，改动后必须跑 `node probe/smoke-client.mjs`。宿主半是普通 ESM（`type: module`），可由 `probe/smoke-host.mjs` 直接 `import`。

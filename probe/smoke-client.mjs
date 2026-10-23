@@ -125,6 +125,7 @@ const {
   QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,
   formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaFailureOf, quotaTitleOf, quotaToneOf,
   formatMoney, extraUsageParts, CURRENCY_SYMBOLS,
+  ROUTE_ALIASES, canonicalRouteId, aliasLookup, colorPresentationFor,
 } = exports_.__test
 
 /** 组件渲染入口：每次渲染前把 useSub 序号归零，保证播种序号稳定。 */
@@ -446,6 +447,24 @@ check('S5e 未入表未知路由仍自动推导', (() => {
   return badge !== null && badge.text === 'AOne'
 })())
 check('S5e 覆盖不改变悬停 title', badgeOf(labelState('codex-relay', 'Codex Relay')).title === 'Codex Relay (codex-relay)')
+
+/* ── S5f：路由别名归一化（同一家 provider 的设备命名差异） ─────────── */
+
+check('S5f 别名表只登记 opencodego → opencode-go', JSON.stringify(ROUTE_ALIASES) === '{"opencodego":"opencode-go"}')
+check('S5f canonicalRouteId 归一化 / 原样 / 非法输入', canonicalRouteId('opencodego') === 'opencode-go'
+  && canonicalRouteId('opencode-go') === 'opencode-go' && canonicalRouteId('provider-alpha') === 'provider-alpha'
+  && canonicalRouteId('') === null && canonicalRouteId(null) === null && canonicalRouteId(42) === null)
+check('S5f aliasLookup 精确优先、未命中再按别名、两处都缺 → null', (() => {
+  const table = { 'opencode-go': 'x', 'kimi-coding': 'y' }
+  return aliasLookup(table, 'opencode-go') === 'x' && aliasLookup(table, 'opencodego') === 'x'
+    && aliasLookup(table, 'nope') === null && aliasLookup(null, 'x') === null
+})())
+check('S5f opencodego 命中缩写表 opengo', badgeOf(labelState('opencodego', 'OpenCode Go')).text === 'opengo')
+check('S5f opencodego 命中色表草绿（colorOf 与桥一致）', colorOf('opencodego', { groups: [], current: { provider: 'opencodego' } }) === '#7CB342'
+  && colorPresentationFor('opencodego', ['opencodego']).color === '#7CB342'
+  && colorPresentationFor('opencodego', ['opencodego']).text === 'opengo')
+check('S5f 未入别名表的路由行为不变', badgeOf(labelState('provider-alpha', 'Alpha One')).text === 'AOne'
+  && colorOf('provider-alpha', { groups: ['provider-alpha'], current: { provider: 'provider-alpha' } }) !== '#7CB342')
 
 /* ── S8：级联模型选择门禁（selectionFor / cascadePlacementFor / ────────── */
 /*        providerIndexByPrefix / providerRowsOf / faceOf.select）           */
@@ -941,6 +960,41 @@ check('S10b OpenCode Go 行渲染三窗口（provider 列 260px）', (() => {
   return rows.length === 4 && typeof text === 'string' && text.startsWith('5h 6% · 7d 36% · 30d 59% · 重置 ')
     && span !== undefined && span.props.style.flex === 'none'
     && typeof span.props.title === 'string' && span.props.title.includes('30d 已用 59%')
+})())
+
+check('S10b 端点键为本机真实 id（opencodego）时该行渲染额度', (() => {
+  quotaRenderState.groups.push({ id: 'opencodego', name: 'OpenCode Go', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] })
+  quotaCache.routes = { opencodego: opencodeQuotaEntry }
+  quotaCache.at = Date.now()
+  const { rows } = renderOpenCascade()
+  const span = quotaSpanOfRow(rowOfId(rows, 'opencodego'))
+  const text = quotaTextOfSpan(span)
+  quotaRenderState.groups.pop()
+  return typeof text === 'string' && text.startsWith('5h 6% · 7d 36% · 30d 59% · 重置 ')
+    && span !== undefined && typeof span.props.title === 'string' && span.props.title.includes('30d 已用 59%')
+})())
+
+check('S10b 端点只给规范名（opencode-go）时本机 opencodego 行仍渲染（别名兜底）', (() => {
+  quotaRenderState.groups.push({ id: 'opencodego', name: 'OpenCode Go', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] })
+  quotaCache.routes = { 'opencode-go': opencodeQuotaEntry }
+  quotaCache.at = Date.now()
+  const { rows } = renderOpenCascade()
+  const span = quotaSpanOfRow(rowOfId(rows, 'opencodego'))
+  const text = quotaTextOfSpan(span)
+  quotaRenderState.groups.pop()
+  return typeof text === 'string' && text.startsWith('5h 6% · 7d 36% · 30d 59%')
+    && span !== undefined && span.props.style.flex === 'none'
+})())
+
+check('S10b 别名为真实 id 时不影响其它行（opencode-go 行照旧渲染）', (() => {
+  quotaRenderState.groups.push({ id: 'opencode-go', name: 'OpenCode Go', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] })
+  quotaCache.routes = { opencodego: opencodeQuotaEntry }
+  quotaCache.at = Date.now()
+  const { rows } = renderOpenCascade()
+  const span = quotaSpanOfRow(rowOfId(rows, 'opencode-go'))
+  const text = quotaTextOfSpan(span)
+  quotaRenderState.groups.pop()
+  return typeof text === 'string' && text.startsWith('5h 6% · 7d 36%')
 })())
 
 quotaCache.routes = null

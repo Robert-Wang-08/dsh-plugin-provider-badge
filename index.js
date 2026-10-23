@@ -52,6 +52,9 @@ const PI_AI_NAMESPACE = 'llm-pi-ai'
  * 浏览器半无需知道路由名（它整表取回，按行 id 命中）。
  *
  * 每条数据源：
+ *  - `routeMatch`：`{baseHosts, aliases}`——**本机真实路由 id 由 baseURL 判定**，
+ *    `aliases` 只作同族命名与兜底（路由 id 因设备而异：本机 `opencodego`、
+ *    另一台 `opencode-go`，故不能靠 id 精确匹配）。
  *  - `auth`：`{kind:'grant', recordKey}` 读授权记录；`{kind:'ref',
  *    fallbackRefs}` 读 settings 里该路由的 `apiKeyEnv` 凭据引用。
  *  - `headers(auth)`：除 `authorization` / `accept` 之外的附加请求头。
@@ -59,6 +62,7 @@ const PI_AI_NAMESPACE = 'llm-pi-ai'
  */
 const QUOTA_SOURCES = Object.freeze({
   'openai-codex': Object.freeze({
+    routeMatch: Object.freeze({ baseHosts: Object.freeze([]), aliases: Object.freeze(['openai-codex']) }),
     auth: Object.freeze({ kind: 'grant', recordKey: 'llm-pi-ai/openai-codex' }),
     url: 'https://chatgpt.com/backend-api/wham/usage',
     headers: (auth) => ({
@@ -70,13 +74,20 @@ const QUOTA_SOURCES = Object.freeze({
     parse: entryFromPayload,
   }),
   'kimi-coding': Object.freeze({
+    routeMatch: Object.freeze({ baseHosts: Object.freeze(['api.kimi.com/coding']), aliases: Object.freeze(['kimi-coding']) }),
     auth: Object.freeze({ kind: 'ref', fallbackRefs: Object.freeze(['KIMI_API_KEY']) }),
     url: 'https://api.kimi.com/coding/v1/usages',
     headers: () => ({}),
     parse: kimiEntryFromPayload,
   }),
   'opencode-go': Object.freeze({
-    auth: Object.freeze({ kind: 'ref', fallbackRefs: Object.freeze(['OPENCODE_API_KEY']) }),
+    // 本机 profile 把这条订阅注册成 `opencodego`（apiKeyEnv `OPENCODEGO_API_KEY`），
+    // 上游与另一台设备写 `opencode-go`。baseURL 判定 + 两个别名都要有。
+    routeMatch: Object.freeze({
+      baseHosts: Object.freeze(['opencode.ai/zen/go']),
+      aliases: Object.freeze(['opencode-go', 'opencodego']),
+    }),
+    auth: Object.freeze({ kind: 'ref', fallbackRefs: Object.freeze(['OPENCODE_API_KEY', 'OPENCODEGO_API_KEY']) }),
     url: 'https://opencode.ai/zen/go/v1/usage',
     headers: () => ({}),
     parse: opencodeEntryFromPayload,
@@ -133,6 +144,90 @@ function numOrNull(value) {
 
 function strOrNull(value) {
   return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+/**
+ * settings 服务 → `llm-pi-ai` 的 providers 段；读不到回 null。
+ * describe() 只暴露声明了 volatile 字段的条目，llm-pi-ai 的 providers 即是。
+ * @param settingsService - 宿主 settings 服务（可空）。
+ * @returns providers 对象或 null。
+ */
+function providersSectionOf(settingsService) {
+  if (settingsService === null || settingsService === undefined || typeof settingsService.describe !== 'function') return null
+  let section
+  try {
+    section = settingsService.describe().find((row) => row !== null && typeof row === 'object' && row.ns === PI_AI_NAMESPACE)?.value
+  } catch (error) {
+    return null
+  }
+  if (section === null || typeof section !== 'object') return null
+  const providers = section.providers
+  if (providers === null || typeof providers !== 'object' || Array.isArray(providers)) return null
+  return providers
+}
+
+/**
+ * 数据源 → 本机**真实**路由 id（按 provider 的 `baseURL` 判定，不靠 id）。
+ * 路由 id 因设备而异（本机 `opencodego`、另一台 `opencode-go`），baseURL 不会。
+ * @param providers - settings 的 providers 段（可空）。
+ * @param source - 一条 QUOTA_SOURCES 项。
+ * @returns 命中的路由 id 数组（无命中回 []）。
+ */
+function matchedRouteIds(providers, source) {
+  const match = source !== null && typeof source === 'object' && source.routeMatch !== null && typeof source.routeMatch === 'object'
+    ? source.routeMatch : null
+  const hosts = match !== null && Array.isArray(match.baseHosts)
+    ? match.baseHosts.filter((host) => typeof host === 'string' && host.length > 0) : []
+  const ids = []
+  if (hosts.length === 0 || providers === null) return ids
+  for (const id of Object.keys(providers)) {
+    const profile = providers[id]
+    if (profile === null || typeof profile !== 'object') continue
+    const baseURL = strOrNull(profile.baseURL)
+    if (baseURL === null) continue
+    if (hosts.some((host) => baseURL.includes(host)) && ids.includes(id) !== true) ids.push(id)
+  }
+  return ids
+}
+
+/**
+ * 数据源 → 可用于命中的路由 id：别名在前、baseURL 判定的真实 id 在后。
+ * 消费方（readAll 的键、sourceOfRoute 的命中）都从这里取，保证「同一家 provider
+ * 在不同设备上叫什么都能命中」。
+ * @param providers - settings 的 providers 段（可空）。
+ * @param source - 一条 QUOTA_SOURCES 项。
+ * @returns 路由 id 数组（至少别名部分；别名缺失时可能为空）。
+ */
+function routeIdsFor(providers, source) {
+  const match = source !== null && typeof source === 'object' && source.routeMatch !== null && typeof source.routeMatch === 'object'
+    ? source.routeMatch : null
+  const ids = []
+  for (const alias of match !== null && Array.isArray(match.aliases) ? match.aliases : []) {
+    if (typeof alias === 'string' && alias.length > 0 && ids.includes(alias) !== true) ids.push(alias)
+  }
+  for (const id of matchedRouteIds(providers, source)) {
+    if (ids.includes(id) !== true) ids.push(id)
+  }
+  return ids
+}
+
+/**
+ * 路由 id → 数据源。先精确命中数据源键（规范名），再按别名/baseURL 命中。
+ * @param route - 浏览器半的 `row.id`。
+ * @param providers - settings 的 providers 段（可空）。
+ * @returns `{sourceId, source}` 或 null。
+ */
+function sourceOfRoute(route, providers) {
+  if (typeof route !== 'string' || route.length === 0) return null
+  if (Object.prototype.hasOwnProperty.call(QUOTA_SOURCES, route)) {
+    return { sourceId: route, source: QUOTA_SOURCES[route] }
+  }
+  for (const sourceId of Object.keys(QUOTA_SOURCES)) {
+    if (routeIdsFor(providers, QUOTA_SOURCES[sourceId]).includes(route)) {
+      return { sourceId, source: QUOTA_SOURCES[sourceId] }
+    }
+  }
+  return null
 }
 
 /** 宽松取数：Kimi 的计数是字符串数字（`"limit":"100"`），Codex 的是数字。 */
@@ -501,20 +596,12 @@ function createQuotaService(options) {
   /**
    * settings 里该路由当前生效的凭据引用名；读不到回 null。
    * 不缓存：用户手工改 settings 立即被采纳。
+   * `route` 必须是**本机真实路由 id**（如 `opencodego`）——传规范名会让回退引用名
+   * 顶替掉该路由真正配置的那把 key，从而读到另一账号的额度。
    */
   function configuredRefOf(route) {
-    const service = settingsOf()
-    if (service === null || service === undefined || typeof service.describe !== 'function') return null
-    let section
-    try {
-      // describe() 只暴露声明了 volatile 字段的条目，llm-pi-ai 的 providers 即是。
-      section = service.describe().find((row) => row !== null && typeof row === 'object' && row.ns === PI_AI_NAMESPACE)?.value
-    } catch (error) {
-      return null
-    }
-    if (section === null || typeof section !== 'object') return null
-    const providers = section.providers
-    if (providers === null || typeof providers !== 'object') return null
+    const providers = providersSectionOf(settingsOf())
+    if (providers === null) return null
     const profile = providers[route]
     if (profile === null || typeof profile !== 'object') return null
     return strOrNull(profile.apiKeyEnv)
@@ -617,34 +704,73 @@ function createQuotaService(options) {
     return source.parse(payload, now()) ?? { ok: false, reason: 'no-windows' }
   }
 
-  async function readOne(route) {
-    const source = Object.prototype.hasOwnProperty.call(QUOTA_SOURCES, route) ? QUOTA_SOURCES[route] : undefined
-    if (source === undefined) return { ok: false, reason: 'unsupported' }
-    const cached = cache.get(route)
-    if (cached !== undefined && now() - cached.at < CACHE_TTL_MS) return cached.entry
-    const pending = inflight.get(route)
+  /** 该数据源在 readAll 里对外暴露的键：规范名 + baseURL 判定的真实 id。 */
+  function emittedIdsOf(providers, sourceId) {
+    const ids = [sourceId]
+    for (const id of matchedRouteIds(providers, QUOTA_SOURCES[sourceId])) {
+      if (ids.includes(id) !== true) ids.push(id)
+    }
+    return ids
+  }
+
+  /**
+   * 决定用哪把凭据的路由 id：优先 settings 里真实存在的那个（命中 baseURL 的），
+   * 否则回数据源规范名。
+   */
+  function credentialRouteIdOf(providers, sourceId) {
+    if (providers !== null) {
+      const ids = matchedRouteIds(providers, QUOTA_SOURCES[sourceId])
+      for (let index = ids.length - 1; index >= 0; index -= 1) {
+        const profile = providers[ids[index]]
+        if (profile !== null && typeof profile === 'object') return ids[index]
+      }
+    }
+    return sourceId
+  }
+
+  /**
+   * 按 **sourceId** 缓存 / 单飞：同一份上游数据即使被多个路由 id 共用也只打一次。
+   * @param sourceId - QUOTA_SOURCES 的键。
+   * @param credentialRouteId - 解析凭据用的真实路由 id。
+   */
+  function readSource(sourceId, credentialRouteId) {
+    const cached = cache.get(sourceId)
+    if (cached !== undefined && now() - cached.at < CACHE_TTL_MS) return Promise.resolve(cached.entry)
+    const pending = inflight.get(sourceId)
     if (pending !== undefined) return pending
-    const task = fetchOne(route, source)
+    const task = fetchOne(credentialRouteId, QUOTA_SOURCES[sourceId])
       .catch((error) => ({ ok: false, reason: 'unexpected', message: messageOf(error) }))
       .then((entry) => {
-        cache.set(route, { at: now(), entry })
+        cache.set(sourceId, { at: now(), entry })
         return entry
       })
-      .finally(() => { inflight.delete(route) })
-    inflight.set(route, task)
+      .finally(() => { inflight.delete(sourceId) })
+    inflight.set(sourceId, task)
     return task
   }
 
+  async function readOne(route) {
+    const providers = providersSectionOf(settingsOf())
+    const hit = sourceOfRoute(route, providers)
+    if (hit === null) return { ok: false, reason: 'unsupported' }
+    return readSource(hit.sourceId, credentialRouteIdOf(providers, hit.sourceId))
+  }
+
   async function readAll() {
+    const providers = providersSectionOf(settingsOf())
     const routes = {}
-    const ids = Object.keys(QUOTA_SOURCES)
-    await Promise.all(ids.map(async (route) => { routes[route] = await readOne(route) }))
+    await Promise.all(Object.keys(QUOTA_SOURCES).map(async (sourceId) => {
+      const entry = await readSource(sourceId, credentialRouteIdOf(providers, sourceId))
+      // 同一份条目写给每个键：本机 id（如 opencodego）与规范名（opencode-go）都能命中。
+      for (const id of emittedIdsOf(providers, sourceId)) routes[id] = entry
+    }))
     return routes
   }
 
   function invalidate(route) {
-    if (route === undefined) cache.clear()
-    else cache.delete(route)
+    if (route === undefined) { cache.clear(); return }
+    const hit = sourceOfRoute(route, providersSectionOf(settingsOf()))
+    cache.delete(hit !== null ? hit.sourceId : route)
   }
 
   return { readOne, readAll, invalidate }
@@ -716,6 +842,10 @@ export const __test = {
   PI_AI_NAMESPACE,
   QUOTA_SOURCES,
   QUOTA_PATH,
+  providersSectionOf,
+  routeIdsFor,
+  matchedRouteIds,
+  sourceOfRoute,
   CACHE_TTL_MS,
   EXPIRY_SKEW_MS,
   clampPercent,

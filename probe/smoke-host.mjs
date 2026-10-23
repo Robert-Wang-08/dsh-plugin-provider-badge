@@ -31,6 +31,7 @@ const {
   kimiWindowsFromUsages, kimiWindowsFromCounts, kimiWindowsFromWeeklyUsage, kimiEntryFromPayload,
   OPENCODE_WINDOW_SECONDS, opencodeEntryFromPayload,
   createQuotaService, isLocalRequest,
+  providersSectionOf, routeIdsFor, matchedRouteIds, sourceOfRoute,
 } = __test
 
 let passed = 0
@@ -59,8 +60,15 @@ check('H1 codex 上游走 wham/usage（codex/usage 实测 403）', QUOTA_SOURCES
 check('H1 kimi 数据源走 apiKeyEnv 引用并回退 KIMI_API_KEY', QUOTA_SOURCES['kimi-coding'].auth.kind === 'ref'
   && QUOTA_SOURCES['kimi-coding'].auth.fallbackRefs.join(',') === 'KIMI_API_KEY')
 check('H1 kimi 上游走 /coding/v1/usages', QUOTA_SOURCES['kimi-coding'].url === 'https://api.kimi.com/coding/v1/usages')
-check('H1 opencode-go 数据源走 apiKeyEnv 引用并回退 OPENCODE_API_KEY', QUOTA_SOURCES['opencode-go'].auth.kind === 'ref'
-  && QUOTA_SOURCES['opencode-go'].auth.fallbackRefs.join(',') === 'OPENCODE_API_KEY')
+check('H1 opencode-go 数据源走 apiKeyEnv 引用并回退 OPENCODE_API_KEY / OPENCODEGO_API_KEY', QUOTA_SOURCES['opencode-go'].auth.kind === 'ref'
+  && QUOTA_SOURCES['opencode-go'].auth.fallbackRefs.join(',') === 'OPENCODE_API_KEY,OPENCODEGO_API_KEY')
+check('H1 opencode-go 用 baseURL 判定真实路由 id（别名 opencode-go / opencodego）', (() => {
+  const match = QUOTA_SOURCES['opencode-go'].routeMatch
+  return match.baseHosts.join(',') === 'opencode.ai/zen/go'
+    && match.aliases.join(',') === 'opencode-go,opencodego'
+})())
+check('H1 kimi / codex 数据源也声明了 routeMatch（同一套判定入口）', QUOTA_SOURCES['kimi-coding'].routeMatch.baseHosts.join(',') === 'api.kimi.com/coding'
+  && QUOTA_SOURCES['openai-codex'].routeMatch.aliases.join(',') === 'openai-codex')
 check('H1 opencode-go 上游走 /zen/go/v1/usage（当前 CLI 推导路径）',
   QUOTA_SOURCES['opencode-go'].url === 'https://opencode.ai/zen/go/v1/usage')
 check('H1 三条数据源的 headers 只额外加 Codex 专属头', (() => {
@@ -233,7 +241,9 @@ function makeSettings(providersOrRef) {
   const calls = { describe: 0 }
   const shape = {}
   for (const [route, ref] of Object.entries(providers)) {
-    shape[route] = ref === undefined ? {} : { apiKeyEnv: ref }
+    // 值是字符串时是「只声明 apiKeyEnv」的简写；对象时是完整 provider profile（可带 baseURL）。
+    shape[route] = ref === undefined ? {}
+      : (ref !== null && typeof ref === 'object' ? { ...ref } : { apiKeyEnv: ref })
   }
   return {
     calls,
@@ -871,6 +881,69 @@ await (async () => {
   clock += CACHE_TTL_MS + 1
   await service.readOne('opencode-go')
   check('H9 缓存对 opencode-go 同样生效', calls.length === 2 && creds.calls.resolve.length === 2)
+})()
+
+/* ── H10：路由 id 因设备而异（baseURL 判定 + 别名） ────────────────── */
+
+const OPENCODE_GO_PROVIDER = {
+  displayName: 'OpenCode Go',
+  apiKeyEnv: 'OPENCODEGO_API_KEY',
+  baseURL: 'https://opencode.ai/zen/go/v1',
+}
+
+check('H10 routeIdsFor 按 baseURL 判定本机真实路由 id（别名在前）', (() => {
+  const ids = routeIdsFor({ opencodego: OPENCODE_GO_PROVIDER }, QUOTA_SOURCES['opencode-go'])
+  return ids.join(',') === 'opencode-go,opencodego'
+})())
+
+check('H10 routeIdsFor 去重保序（settings 已有规范名时不重复）', (() => {
+  const providers = {
+    'opencode-go': { baseURL: 'https://opencode.ai/zen/go/v1', apiKeyEnv: 'OPENCODE_API_KEY' },
+    opencodego: OPENCODE_GO_PROVIDER,
+  }
+  return routeIdsFor(providers, QUOTA_SOURCES['opencode-go']).join(',') === 'opencode-go,opencodego'
+})())
+
+check('H10 不误伤无关 provider（baseURL 不含 zen/go）', (() => {
+  const providers = { 'gemini-relay': { baseURL: 'https://generativelanguage.googleapis.com/v1beta' } }
+  return routeIdsFor(providers, QUOTA_SOURCES['opencode-go']).join(',') === 'opencode-go,opencodego'
+    && matchedRouteIds(providers, QUOTA_SOURCES['opencode-go']).length === 0
+})())
+
+check('H10 sourceOfRoute 别名与真实 id 命中同一条数据源，未知 id → null', (() => {
+  const providers = { opencodego: OPENCODE_GO_PROVIDER }
+  const byAlias = sourceOfRoute('opencodego', providers)
+  const byCanonical = sourceOfRoute('opencode-go', providers)
+  return byAlias !== null && byCanonical !== null
+    && byAlias.sourceId === 'opencode-go' && byCanonical.sourceId === 'opencode-go'
+    && sourceOfRoute('no-such-route', providers) === null && sourceOfRoute('', providers) === null
+})())
+
+check('H10 providersSectionOf 从 settings 服务取出 providers 段', (() => {
+  const providers = providersSectionOf(makeSettings({ opencodego: OPENCODE_GO_PROVIDER }).service)
+  return providers !== null && providers.opencodego.baseURL === 'https://opencode.ai/zen/go/v1'
+    && providersSectionOf(undefined) === null && providersSectionOf({}) === null
+})())
+
+await (async () => {
+  const { stub, calls } = makeFetchStub(() => okResponse(REAL_OPENCODE_PAYLOAD))
+  const settings = makeSettings({ opencodego: OPENCODE_GO_PROVIDER })
+  const creds = makeCredentials(undefined, { OPENCODEGO_API_KEY: OPENCODE_KEY, OPENCODE_API_KEY: 'sk-other-account' })
+  const service = createQuotaService({ credentialsOf: () => creds.service, settingsOf: () => settings.service, fetchImpl: stub })
+  const res = await service.readOne('opencodego')
+  check('H10 凭据按真实路由 id 解析（OPENCODEGO_API_KEY 优先于回退名）', creds.calls.resolve.join(',') === 'OPENCODEGO_API_KEY')
+  check('H10 opencodego 直接读到三窗口条目，且只打一次上游', res.ok === true && res.windows.length === 3 && calls.length === 1)
+})()
+
+await (async () => {
+  const { stub, calls } = makeFetchStub(() => okResponse(REAL_OPENCODE_PAYLOAD))
+  const settings = makeSettings({ opencodego: OPENCODE_GO_PROVIDER })
+  const creds = makeCredentials(undefined, { OPENCODEGO_API_KEY: OPENCODE_KEY })
+  const service = createQuotaService({ credentialsOf: () => creds.service, settingsOf: () => settings.service, fetchImpl: stub })
+  const all = await service.readAll()
+  check('H10 readAll 同时暴露规范名与本机真实 id（同一份条目）', all['opencode-go'] !== undefined && all.opencodego !== undefined
+    && JSON.stringify(all['opencode-go']) === JSON.stringify(all.opencodego))
+  check('H10 readAll 键数 = 3 + 命中数，且同一数据源只打一次上游', Object.keys(all).length === 4 && calls.length === 1)
 })()
 
 /* ── 汇总 ─────────────────────────────────────────────────────────── */
