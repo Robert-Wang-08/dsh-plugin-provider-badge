@@ -143,6 +143,10 @@ window.__ModuleLoader__.load({
     /** 路由 id → 别名归一化后的 id；未入表原样返回，非字符串/空 → null。 */
     function canonicalRouteId(routeId) {
       if (typeof routeId !== "string" || routeId.length === 0) return null;
+      // 配置下发的别名优先于内置别名表（设备/组织自定义命名）。
+      const configured = Object.prototype.hasOwnProperty.call(uiOverrides.aliases, routeId)
+        ? uiOverrides.aliases[routeId] : null;
+      if (configured !== null) return configured;
       return Object.prototype.hasOwnProperty.call(ROUTE_ALIASES, routeId) ? ROUTE_ALIASES[routeId] : routeId;
     }
 
@@ -158,6 +162,24 @@ window.__ModuleLoader__.load({
       const canonical = canonicalRouteId(routeId);
       if (canonical !== null && Object.prototype.hasOwnProperty.call(table, canonical)) return table[canonical];
       return null;
+    }
+
+    /**
+     * 查一张路由表，优先级：配置覆盖(原 id) → 代码表(原 id) → 配置覆盖(规范名) → 代码表(规范名)。
+     * @param table - 代码里的默认表（`ROUTE_COLORS` / `ROUTE_LABELS`）。
+     * @param kind - 覆盖表类别：`colors` / `labels`。
+     * @param routeId - 路由 id。
+     * @returns 命中的值或 null。
+     */
+    function routeTableValue(table, kind, routeId) {
+      if (typeof routeId !== "string" || routeId.length === 0) return null;
+      const custom = uiLookup(kind, routeId);
+      if (custom !== null) return custom;
+      const direct = aliasLookup(table, routeId);
+      if (direct !== null) return direct;
+      const canonical = canonicalRouteId(routeId);
+      if (canonical === null) return null;
+      return uiLookup(kind, canonical);
     }
 
     /**
@@ -208,6 +230,82 @@ window.__ModuleLoader__.load({
      * `entry.ok === false`，宿主不解释原因，浏览器半一律不渲染。
      */
     const QUOTA_ENDPOINT = "/provider-badge/quota";
+
+    /**
+     * 生效配置端点（宿主半）。回显 `{ ok, configVersion, enabled, sources, ui, warnings }`；
+     * 本半只关心 `ui.labels` / `ui.colors` / `ui.aliases` 三类覆盖，其余字段是给人看的。
+     */
+    const CONFIG_ENDPOINT = "/provider-badge/config";
+
+    /** 配置缓存：整页生命周期内最多取一次（配置改动需重启 DSH，不需要短 TTL）。 */
+    const configCache = { at: 0, version: null };
+
+    /**
+     * 配置覆盖表：`{ labels, colors, aliases }`，键为路由 id。
+     * 代码里的 `ROUTE_LABELS` / `ROUTE_COLORS` / `ROUTE_ALIASES` 仍是默认值，
+     * 这里只放 pack `config` 下发的覆盖项（谁也没下发就是空表）。
+     */
+    const uiOverrides = { labels: {}, colors: {}, aliases: {} };
+
+    /** 颜色值合法性：配置里只接受 `#RRGGBB`。 */
+    const HEX_COLOR = /^#[0-9A-Fa-f]{6}$/;
+
+    /**
+     * 校验并写入覆盖表；非法项直接丢弃（不抛错，徽标不能因为配置写错而不显示）。
+     * @param ui - 端点返回的 `ui` 段（可空）。
+     * @returns 是否真的改动了任何一项。
+     */
+    function applyUiConfig(ui) {
+      if (ui === null || typeof ui !== "object") return false;
+      let changed = false;
+      for (const kind of ["labels", "colors", "aliases"]) {
+        const table = ui[kind];
+        if (table === null || typeof table !== "object" || Array.isArray(table)) continue;
+        for (const routeId of Object.keys(table)) {
+          const value = table[routeId];
+          if (typeof routeId !== "string" || routeId.length === 0) continue;
+          if (typeof value !== "string" || value.length === 0) continue;
+          if (kind === "colors" && HEX_COLOR.test(value) !== true) continue;
+          if (kind === "labels" && value.length > 8) continue;
+          if (kind === "aliases" && value.length > 64) continue;
+          if (uiOverrides[kind][routeId] === value) continue;
+          uiOverrides[kind][routeId] = value;
+          changed = true;
+        }
+      }
+      return changed;
+    }
+
+    /** 取某一类覆盖值；没有回 null。 */
+    function uiLookup(kind, routeId) {
+      const table = uiOverrides[kind];
+      if (typeof routeId !== "string" || table === null || typeof table !== "object") return null;
+      return Object.prototype.hasOwnProperty.call(table, routeId) ? table[routeId] : null;
+    }
+
+    /**
+     * 取一次生效配置（失败静默：额度与配色是锦上添花，不能挡住模型选择）。
+     * @returns 是否有覆盖变化（决定要不要重渲染）。
+     */
+    async function fetchUiConfig() {
+      if (typeof fetch !== "function") return false;
+      try {
+        const response = await fetch(CONFIG_ENDPOINT, {
+          headers: { accept: "application/json" },
+          signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+            ? AbortSignal.timeout(10000)
+            : undefined,
+        });
+        if (response === null || response === undefined || response.ok !== true) return false;
+        const data = await response.json();
+        if (data === null || typeof data !== "object") return false;
+        configCache.at = Date.now();
+        configCache.version = typeof data.configVersion === "number" ? data.configVersion : null;
+        return applyUiConfig(data.ui);
+      } catch (_) {
+        return false;
+      }
+    }
 
     /** 客户端缓存窗口：小于宿主的 60s 上游缓存窗口，重开菜单时最多补一次请求。 */
     const QUOTA_CLIENT_TTL_MS = 25000;
@@ -533,7 +631,7 @@ window.__ModuleLoader__.load({
      * 哈希回退调色板（未入表路由的槽位分配不变）。
      */
     function colorOf(routeId, state) {
-      const tabled = typeof routeId === "string" ? aliasLookup(ROUTE_COLORS, routeId) : null;
+      const tabled = typeof routeId === "string" ? routeTableValue(ROUTE_COLORS, "colors", routeId) : null;
       if (tabled !== null) return tabled;
       const slots = hueSlotsFor(routeIdsOf(state));
       const slot = slots.get(routeId);
@@ -1026,7 +1124,7 @@ window.__ModuleLoader__.load({
         );
         if (group !== undefined) displayName = group.name;
       }
-      const override = aliasLookup(ROUTE_LABELS, routeId);
+      const override = routeTableValue(ROUTE_LABELS, "labels", routeId);
       const text = override !== null ? override : deriveLetters(displayName, routeId);
       if (text === null) return null;
       const title = displayName !== null ? displayName + " (" + routeId + ")" : routeId;
@@ -1213,6 +1311,9 @@ window.__ModuleLoader__.load({
       const [quickSlotIndex, setQuickSlotIndex] = useState(0);
       const keyBufferRef = useRef({ text: "", at: 0 });
       const badgeRef = useRef(null);
+      // 配置覆盖版本号：取到配置且确实改动了覆盖表时 +1，触发一次重渲染。
+      // 新增 hook 一律追加在末尾——probe 用调用序号播种，既有序号不得变化。
+      const [, setUiConfigVersion] = useState(0);
 
       useEffect(() => {
         if (typeof face.load === "function") face.load();
@@ -1247,6 +1348,20 @@ window.__ModuleLoader__.load({
         run();
         return () => { cancelled = true; };
       }, [cascadeOpen]);
+
+      // 生效配置（缩写/配色/别名覆盖）：挂载后取一次，拿到覆盖就重渲染一次。
+      // 与额度一样静默失败——配置端点不可用时退回代码里的默认表。
+      useEffect(() => {
+        if (typeof fetch !== "function") return undefined;
+        if (configCache.at !== 0 && Date.now() - configCache.at < QUOTA_CLIENT_TTL_MS) return undefined;
+        let cancelled = false;
+        const run = async () => {
+          const changed = await fetchUiConfig();
+          if (!cancelled && changed) setUiConfigVersion((version) => version + 1);
+        };
+        run();
+        return () => { cancelled = true; };
+      }, []);
 
       const closeAll = () => {
         setCascade(null);
@@ -2244,7 +2359,7 @@ window.__ModuleLoader__.load({
         status: "ready",
       };
       const color = resolveColor(providerId, state, loadOverrides());
-      const label = aliasLookup(ROUTE_LABELS, providerId);
+      const label = routeTableValue(ROUTE_LABELS, "labels", providerId);
       const text = label !== null ? label : deriveLetters(providerId, providerId);
       if (text === null) return null;
       return Object.freeze({
@@ -2338,6 +2453,7 @@ window.__ModuleLoader__.load({
       selectionFor, cascadePlacementFor, providerIndexByPrefix, nextEnabledIndex, providerRowsOf,
       shouldCloseOnScroll,
       QUOTA_ENDPOINT, QUOTA_CLIENT_TTL_MS, QUOTA_TONES, quotaCache,
+      CONFIG_ENDPOINT, configCache, uiOverrides, applyUiConfig, uiLookup, fetchUiConfig, routeTableValue,
       formatWindowSpan, formatCountdown, quotaWindowsOf, quotaTextOf, quotaInlineTextOf, quotaFailureOf, quotaTitleOf, quotaToneOf,
       formatMoney, extraUsageParts, CURRENCY_SYMBOLS,
     };

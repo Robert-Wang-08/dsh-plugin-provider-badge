@@ -103,6 +103,24 @@ DSH Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）增强插件：在会
 | 缓存 | 宿主侧 60s、按**数据源**记账（同一数据源被多个路由 id 共用也只打一次上游），并单飞合并并发请求；客户端侧 25s；收到 `credentials/record-updated` 时立刻失效对应数据源缓存 |
 | 安全 | 端点只应答回环请求（非回环 403、非 GET 405）；上游非 200 只回状态码不回响应体；任何响应都不含令牌、邮箱、账号 id |
 
+### 可见配置（v0.3.1）
+
+额度查询参数与徽标的缩写/配色不再是"只能读 JS"的隐藏常量：
+
+| 项 | 值 |
+| --- | --- |
+| 生效配置端点 | `GET /provider-badge/config` → `{ ok, configVersion, enabled, cacheTtlMs, timeoutMs, warnings[], sources{...}, ui{labels,colors,aliases} }`；同样只答回环、只答 GET、**不含任何凭据值**（只含 `refNames` 引用名） |
+| 三层结构 | ① 代码常量是**默认值唯一真相**（`CONFIG_DEFAULTS` / `QUOTA_SOURCES` / `ROUTE_LABELS` / `ROUTE_COLORS` / `ROUTE_ALIASES`）；② patch `- id: provider-badge` + `config:` 只写**覆盖**；③ 端点回显生效结果 |
+| 可配项 | `enabled`、`cacheTtlMs`（5000..600000）、`timeoutMs`（1000..30000）、`sources.<规范名>.{enabled,baseHosts,aliases,usagePath}`、`ui.{labels,colors,aliases}` |
+| 非法项 | 一律降级为默认值 + 一条 `warnings[{path,message}]`，端点照常 200；`config` 写错不会让插件崩在启动阶段 |
+| 安全 | `usagePath` 只允许 `/` 开头的同源路径，或 **https 且主机 ∈ `opencode.ai` / `api.kimi.com` / `chatgpt.com`**；其它一律忽略——额度请求带真凭据，URL 自由覆盖等于可被配置注入外发。配置里**只写引用名，不写值** |
+| 不配 | 窗口秒数映射与 `parse`（响应形状知识，写错只会静默错标）；凭据名（由 settings 的 `apiKeyEnv` 读） |
+| 设备差异 | 不需要配置：宿主按 settings 里 provider 的 `baseURL` 判定真实路由 id，浏览器半另有别名兜底 |
+
+覆盖示例与"为什么不放进 `dsh-config-pack/config/`"见该包的 `docs/provider-badge-config.md` 与
+`examples/provider-badge.config.yml`（patch 按 id 覆盖，无条件声明会让**没装本插件**的设备报
+`patch: entry ... not found`）。
+
 ### 各数据源的口径
 
 **Codex**：`rate_limit.primary_window` / `secondary_window` 的 `used_percent` + `limit_window_seconds` + `reset_at`/`reset_after_seconds`；窗口按**时长**排（上游把 5h 放 primary 还是 secondary 都识别）；`plan_type` 作套餐名；`limit_reached` 透传；`credits` 抽 `has_credits`/`unlimited`/`balance`。同一 token 打 `/backend-api/codex/usage` 实测回 403（HTML 错误页），`/wham/usage` 回 200 JSON。

@@ -128,6 +128,7 @@ const {
   ROUTE_ALIASES, canonicalRouteId, aliasLookup, colorPresentationFor,
   QUICK_MAX_SLOTS, QUICK_STORAGE_KEY, DEFAULT_QUICK_MODELS, QUICK_LABEL_MAX,
   quickLabelOf, normalizeQuickModels, defaultQuickModels, loadQuickModels, saveQuickModels, quickStatusOf,
+  CONFIG_ENDPOINT, configCache, uiOverrides, applyUiConfig, uiLookup, fetchUiConfig, routeTableValue,
 } = exports_.__test
 
 /** 组件渲染入口：每次渲染前把 useSub 序号归零，保证播种序号稳定。 */
@@ -510,6 +511,62 @@ check('S5f opencodego 命中色表草绿（colorOf 与桥一致）', colorOf('op
   && colorPresentationFor('opencodego', ['opencodego']).text === 'opengo')
 check('S5f 未入别名表的路由行为不变', badgeOf(labelState('provider-alpha', 'Alpha One')).text === 'AOne'
   && colorOf('provider-alpha', { groups: ['provider-alpha'], current: { provider: 'provider-alpha' } }) !== '#7CB342')
+
+/* ── S5g：可见配置覆盖（缩写 / 配色 / 别名） ───────────────────────── */
+
+check('S5g 配置端点与覆盖表就位、默认空表', CONFIG_ENDPOINT === "/provider-badge/config"
+  && Object.keys(uiOverrides.labels).length === 0 && Object.keys(uiOverrides.colors).length === 0
+  && Object.keys(uiOverrides.aliases).length === 0)
+
+check('S5g applyUiConfig 接受合法项、丢弃非法项', (() => {
+  configCache.at = 1
+  const changed = applyUiConfig({
+    labels: { 'provider-alpha': 'alp', 'provider-beta': '123456789' },
+    colors: { 'provider-alpha': '#123456', 'provider-beta': 'red', 'provider-gamma-one': '#ABCDEF' },
+    aliases: { 'provider-delta': 'provider-gamma-one' },
+  })
+  return changed === true
+    && uiOverrides.labels['provider-alpha'] === 'alp' && uiOverrides.labels['provider-beta'] === undefined
+    && uiOverrides.colors['provider-alpha'] === '#123456' && uiOverrides.colors['provider-beta'] === undefined
+    && uiOverrides.colors['provider-gamma-one'] === '#ABCDEF'
+    && uiOverrides.aliases['provider-delta'] === 'provider-gamma-one'
+})())
+
+check('S5g 覆盖优先于代码表（徽标 / 底色 / 桥）', badgeOf(labelState('provider-alpha', 'Alpha One')).text === 'alp'
+  && colorOf('provider-alpha', { groups: [], current: { provider: 'provider-alpha' } }) === '#123456'
+  && colorPresentationFor('provider-alpha', ['provider-alpha']).color === '#123456'
+  && colorPresentationFor('provider-alpha', ['provider-alpha']).text === 'alp')
+
+check('S5g 配置别名生效（canonicalRouteId / 反向查表）', canonicalRouteId('provider-delta') === 'provider-gamma-one'
+  && routeTableValue(ROUTE_COLORS, 'colors', 'provider-delta') === '#ABCDEF')
+
+check('S5g 未覆盖的路由仍走代码表', badgeOf(labelState('codex-relay', 'Codex Relay')).text === 'a1gpt'
+  && colorOf('codex-relay', { groups: [], current: { provider: 'codex-relay' } }) === '#2F6FEB'
+  && badgeOf(labelState('opencodego', 'OpenCode Go')).text === 'opengo')
+
+check('S5g applyUiConfig 幂等（同值不报变化）', (() => {
+  const again = applyUiConfig({ labels: { 'provider-alpha': 'alp' } })
+  const same = applyUiConfig(null)
+  return again === false && same === false
+})())
+
+check('S5g 覆盖不会污染默认表（ROUTE_LABELS / ROUTE_COLORS 未变）', (() => {
+  const before = JSON.stringify([ROUTE_LABELS, ROUTE_COLORS, ROUTE_ALIASES])
+  applyUiConfig({ labels: { 'kimi-coding': 'km' }, colors: { 'kimi-coding': '#000000' } })
+  const after = JSON.stringify([ROUTE_LABELS, ROUTE_COLORS, ROUTE_ALIASES])
+  return before === after && badgeOf(labelState('kimi-coding', 'Kimi Coding')).text === 'km'
+})())
+
+check('S5g 源码：不再新增第二个端点常量，配置与额度同源取数', source.includes('CONFIG_ENDPOINT = "/provider-badge/config"')
+  && source.includes('CONFIG_ENDPOINT, {'))
+
+// 复位：后续用例依赖默认表。
+for (const kind of ['labels', 'colors', 'aliases']) {
+  for (const key of Object.keys(uiOverrides[kind])) delete uiOverrides[kind][key]
+}
+configCache.at = 0
+check('S5g 复位后回到代码默认（alp 消失）', badgeOf(labelState('provider-alpha', 'Alpha One')).text === 'AOne'
+  && colorOf('provider-alpha', { groups: [], current: { provider: 'provider-alpha' } }) !== '#123456')
 
 /* ── S8：级联模型选择门禁（selectionFor / cascadePlacementFor / ────────── */
 /*        providerIndexByPrefix / providerRowsOf / faceOf.select）           */

@@ -96,6 +96,8 @@ const QUOTA_SOURCES = Object.freeze({
 
 /** 端点路径：浏览器半按同源相对路径请求。 */
 const QUOTA_PATH = '/provider-badge/quota'
+/** 生效配置的只读回显（"可见配置"）：只含引用名与端点，绝不含凭据值。 */
+const CONFIG_PATH = '/provider-badge/config'
 /** 上游超时：额度面板可以慢，但不能把菜单请求挂死。 */
 const UPSTREAM_TIMEOUT_MS = 8000
 /** 服务端缓存窗口：同一路由最多每分钟打一次上游。 */
@@ -217,17 +219,270 @@ function routeIdsFor(providers, source) {
  * @param providers - settings 的 providers 段（可空）。
  * @returns `{sourceId, source}` 或 null。
  */
-function sourceOfRoute(route, providers) {
+function sourceOfRoute(route, providers, sources) {
   if (typeof route !== 'string' || route.length === 0) return null
-  if (Object.prototype.hasOwnProperty.call(QUOTA_SOURCES, route)) {
-    return { sourceId: route, source: QUOTA_SOURCES[route] }
+  const table = sources !== null && typeof sources === 'object' ? sources : QUOTA_SOURCES
+  if (Object.prototype.hasOwnProperty.call(table, route)) {
+    return { sourceId: route, source: table[route] }
   }
-  for (const sourceId of Object.keys(QUOTA_SOURCES)) {
-    if (routeIdsFor(providers, QUOTA_SOURCES[sourceId]).includes(route)) {
-      return { sourceId, source: QUOTA_SOURCES[sourceId] }
+  for (const sourceId of Object.keys(table)) {
+    if (routeIdsFor(providers, table[sourceId]).includes(route)) {
+      return { sourceId, source: table[sourceId] }
     }
   }
   return null
+}
+
+/* ── 可见配置 ───────────────────────────────────────────────────────────
+ * 分层（2026-10-23 拍板）：
+ *   - **代码常量是默认值唯一真相**：未装 dsh-config-pack、pack 未更新、整块
+ *     config 被替换时不改变行为；
+ *   - pack 的 patch `- id: provider-badge` + `config:` 只写**覆盖**；
+ *   - `GET /provider-badge/config` 回显生效结果，改了什么不用再读 JS。
+ * 三条硬约束：
+ *   1) 输出里只有引用名（`apiKeyEnv` / `recordKey` / `fallbackRefs`），没有值；
+ *   2) usage 端点只允许「同源路径」或「白名单主机的 https 绝对 URL」——额度请求
+ *      带真凭据，URL 自由覆盖等于可被配置注入外发；
+ *   3) 任何非法覆盖都降级成默认值 + 一条 warning，绝不让插件崩在启动阶段。
+ */
+
+/** patch 结构版本：回显里带上，浏览器半可据此判断是否需要重取。 */
+const CONFIG_VERSION = 1
+
+/** 默认值（代码侧真相）。 */
+const CONFIG_DEFAULTS = Object.freeze({
+  enabled: true,
+  cacheTtlMs: 60000,
+  timeoutMs: 8000,
+})
+
+/** 数值项的合法区间：越界收敛，不报错。 */
+const CONFIG_LIMITS = Object.freeze({
+  cacheTtlMs: Object.freeze([5000, 600000]),
+  timeoutMs: Object.freeze([1000, 30000]),
+})
+
+/** usage 端点的允许主机：白名单外一律拒绝覆盖。 */
+const USAGE_HOST_ALLOWLIST = Object.freeze(['opencode.ai', 'api.kimi.com', 'chatgpt.com'])
+
+/** URL → origin（如 `https://opencode.ai`）；无效回 null。 */
+function originOfUrl(value) {
+  const raw = strOrNull(value)
+  if (raw === null) return null
+  try {
+    return new URL(raw).origin
+  } catch (error) {
+    return null
+  }
+}
+
+/** 绝对 URL 是否可作 usage 端点（https + 白名单主机）。 */
+function isAllowedUsageUrl(value) {
+  const raw = strOrNull(value)
+  if (raw === null) return false
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch (error) {
+    return false
+  }
+  if (parsed.protocol !== 'https:') return false
+  return USAGE_HOST_ALLOWLIST.includes(parsed.hostname)
+}
+
+/**
+ * patch 下发的 config → 生效配置 + 警告清单。
+ * @param rawConfig - `apply(ctx, rawConfig)` 的第二参数（可空）。
+ * @returns `{configVersion, enabled, cacheTtlMs, timeoutMs, sources, ui, warnings}`。
+ */
+function resolveConfig(rawConfig) {
+  const raw = rawConfig !== null && typeof rawConfig === 'object' ? rawConfig : {}
+  const warnings = []
+  const warn = (path, message) => { warnings.push({ path, message }) }
+  const resolved = {
+    configVersion: CONFIG_VERSION,
+    enabled: CONFIG_DEFAULTS.enabled,
+    cacheTtlMs: CONFIG_DEFAULTS.cacheTtlMs,
+    timeoutMs: CONFIG_DEFAULTS.timeoutMs,
+    sources: {},
+    ui: { labels: {}, colors: {}, aliases: {} },
+    warnings,
+  }
+  if (raw.enabled !== undefined) {
+    if (typeof raw.enabled === 'boolean') resolved.enabled = raw.enabled
+    else warn('enabled', '必须是布尔值，已忽略')
+  }
+  for (const key of ['cacheTtlMs', 'timeoutMs']) {
+    if (raw[key] === undefined) continue
+    const value = intOf(raw[key])
+    if (value === null) {
+      warn(key, '必须是整数毫秒，已忽略')
+      continue
+    }
+    const range = CONFIG_LIMITS[key]
+    resolved[key] = Math.min(range[1], Math.max(range[0], value))
+  }
+
+  const rawSources = raw.sources !== null && typeof raw.sources === 'object' && Array.isArray(raw.sources) !== true
+    ? raw.sources : {}
+  for (const sourceId of Object.keys(rawSources)) {
+    const override = rawSources[sourceId]
+    const path = 'sources.' + sourceId
+    if (Object.prototype.hasOwnProperty.call(QUOTA_SOURCES, sourceId) !== true) {
+      warn(path, '未知数据源，已忽略')
+      continue
+    }
+    if (override === null || typeof override !== 'object' || Array.isArray(override) === true) {
+      warn(path, '必须是对象，已忽略')
+      continue
+    }
+    const next = {}
+    if (override.enabled !== undefined) {
+      if (typeof override.enabled === 'boolean') next.enabled = override.enabled
+      else warn(path + '.enabled', '必须是布尔值，已忽略')
+    }
+    for (const key of ['baseHosts', 'aliases']) {
+      if (override[key] === undefined) continue
+      if (Array.isArray(override[key]) !== true) {
+        warn(path + '.' + key, '必须是字符串数组，已忽略')
+        continue
+      }
+      const list = override[key]
+        .filter((item) => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim())
+      if (list.length === 0) {
+        warn(path + '.' + key, '空数组等于不覆盖，已忽略')
+        continue
+      }
+      next[key] = list
+    }
+    if (override.usagePath !== undefined) {
+      const value = strOrNull(override.usagePath)
+      if (value === null) warn(path + '.usagePath', '必须是非空字符串，已忽略')
+      else if (value.startsWith('/')) next.usagePath = value
+      else if (isAllowedUsageUrl(value) === true) next.usagePath = value
+      else warn(path + '.usagePath', '绝对 URL 必须是 https 且主机属于 ' + USAGE_HOST_ALLOWLIST.join(' / ') + '，已忽略')
+    }
+    resolved.sources[sourceId] = next
+  }
+
+  const rawUi = raw.ui !== null && typeof raw.ui === 'object' && Array.isArray(raw.ui) !== true ? raw.ui : {}
+  for (const key of ['labels', 'colors', 'aliases']) {
+    const table = rawUi[key]
+    if (table === undefined) continue
+    if (table === null || typeof table !== 'object' || Array.isArray(table) === true) {
+      warn('ui.' + key, '必须是对象，已忽略')
+      continue
+    }
+    for (const routeId of Object.keys(table)) {
+      const value = table[routeId]
+      const path = 'ui.' + key + '.' + routeId
+      const id = strOrNull(routeId)
+      const text = strOrNull(value)
+      if (id === null || text === null) {
+        warn(path, '键与值都必须是非空字符串，已忽略')
+        continue
+      }
+      if (key === 'colors' && /^#[0-9A-Fa-f]{6}$/.test(text) !== true) {
+        warn(path, '颜色必须是 #RRGGBB，已忽略')
+        continue
+      }
+      if (key === 'labels' && text.length > 8) {
+        warn(path, '缩写不得超过 8 个字符，已忽略')
+        continue
+      }
+      if (key === 'aliases' && text.length > 64) {
+        warn(path, '别名目标过长，已忽略')
+        continue
+      }
+      resolved.ui[key][id] = text
+    }
+  }
+  return resolved
+}
+
+/**
+ * 生效配置 → 每个数据源的最终形态（与 QUOTA_SOURCES 项同结构，供服务与回显共用）。
+ * `usagePath` 是路径时拼到默认端点的 origin 上；绝对 URL 已在 resolveConfig 里过白名单。
+ * @param resolved - resolveConfig 的返回值。
+ * @returns `{ [sourceId]: source }`。
+ */
+function effectiveSourcesOf(resolved) {
+  const sources = {}
+  for (const sourceId of Object.keys(QUOTA_SOURCES)) {
+    const base = QUOTA_SOURCES[sourceId]
+    const override = resolved.sources[sourceId] !== undefined ? resolved.sources[sourceId] : {}
+    let url = base.url
+    if (override.usagePath !== undefined) {
+      if (override.usagePath.startsWith('/')) {
+        const origin = originOfUrl(base.url)
+        if (origin !== null) url = origin + override.usagePath
+      } else {
+        url = override.usagePath
+      }
+    }
+    sources[sourceId] = {
+      ...base,
+      url,
+      // 总开关关闭时所有数据源一起停：不读上游、不回条目。
+      enabled: resolved.enabled !== false && override.enabled !== false,
+      routeMatch: {
+        ...base.routeMatch,
+        baseHosts: override.baseHosts !== undefined ? override.baseHosts : base.routeMatch.baseHosts,
+        aliases: override.aliases !== undefined ? override.aliases : base.routeMatch.aliases,
+      },
+    }
+  }
+  return sources
+}
+
+/**
+ * 回显用的只读视图：生效配置 + 本机命中的真实路由 id + 凭据**引用名**。
+ * @param resolved - resolveConfig 的返回值。
+ * @param sources - effectiveSourcesOf 的返回值。
+ * @param providers - settings 的 providers 段（可空）。
+ * @returns 可直接 JSON 化的对象（无凭据值）。
+ */
+function configViewOf(resolved, sources, providers) {
+  const view = {}
+  for (const sourceId of Object.keys(sources)) {
+    const source = sources[sourceId]
+    const routeIds = routeIdsFor(providers, source)
+    const refNames = []
+    for (let index = routeIds.length - 1; index >= 0; index -= 1) {
+      const profile = providers !== null && Object.prototype.hasOwnProperty.call(providers, routeIds[index])
+        ? providers[routeIds[index]] : null
+      const ref = profile !== null && typeof profile === 'object' ? strOrNull(profile.apiKeyEnv) : null
+      if (ref !== null) {
+        refNames.push(ref)
+        break
+      }
+    }
+    if (source.auth.kind === 'grant') refNames.push(source.auth.recordKey)
+    else for (const ref of source.auth.fallbackRefs) refNames.push(ref)
+    const uniqueRefs = []
+    for (const ref of refNames) if (uniqueRefs.includes(ref) !== true) uniqueRefs.push(ref)
+    view[sourceId] = {
+      enabled: source.enabled !== false,
+      usageUrl: source.url,
+      baseHosts: source.routeMatch.baseHosts,
+      aliases: source.routeMatch.aliases,
+      auth: source.auth.kind,
+      refNames: uniqueRefs,
+      parser: typeof source.parse === 'function' ? source.parse.name : null,
+      routeIds,
+    }
+  }
+  return {
+    ok: true,
+    configVersion: resolved.configVersion,
+    enabled: resolved.enabled,
+    cacheTtlMs: resolved.cacheTtlMs,
+    timeoutMs: resolved.timeoutMs,
+    warnings: resolved.warnings,
+    sources: view,
+    ui: resolved.ui,
+  }
 }
 
 /** 宽松取数：Kimi 的计数是字符串数字（`"limit":"100"`），Codex 的是数字。 */
@@ -587,6 +842,10 @@ function opencodeEntryFromPayload(payload, nowMs) {
 function createQuotaService(options) {
   const config = options !== null && typeof options === 'object' ? options : {}
   const now = typeof config.now === 'function' ? config.now : Date.now
+  /** 生效数据源表（默认为代码常量表，测试可注入）。 */
+  const sources = config.sources !== null && typeof config.sources === 'object' ? config.sources : QUOTA_SOURCES
+  const cacheTtlMs = intOf(config.cacheTtlMs) !== null ? config.cacheTtlMs : CACHE_TTL_MS
+  const timeoutMs = intOf(config.timeoutMs) !== null ? config.timeoutMs : UPSTREAM_TIMEOUT_MS
   const credentialsOf = typeof config.credentialsOf === 'function' ? config.credentialsOf : () => undefined
   const settingsOf = typeof config.settingsOf === 'function' ? config.settingsOf : () => undefined
   const fetchImpl = typeof config.fetchImpl === 'function' ? config.fetchImpl : undefined
@@ -687,7 +946,7 @@ function createQuotaService(options) {
           ...source.headers(auth),
         },
         signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
-          ? AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
+          ? AbortSignal.timeout(timeoutMs)
           : undefined,
       })
     } catch (error) {
@@ -707,7 +966,7 @@ function createQuotaService(options) {
   /** 该数据源在 readAll 里对外暴露的键：规范名 + baseURL 判定的真实 id。 */
   function emittedIdsOf(providers, sourceId) {
     const ids = [sourceId]
-    for (const id of matchedRouteIds(providers, QUOTA_SOURCES[sourceId])) {
+    for (const id of matchedRouteIds(providers, sources[sourceId])) {
       if (ids.includes(id) !== true) ids.push(id)
     }
     return ids
@@ -719,7 +978,7 @@ function createQuotaService(options) {
    */
   function credentialRouteIdOf(providers, sourceId) {
     if (providers !== null) {
-      const ids = matchedRouteIds(providers, QUOTA_SOURCES[sourceId])
+      const ids = matchedRouteIds(providers, sources[sourceId])
       for (let index = ids.length - 1; index >= 0; index -= 1) {
         const profile = providers[ids[index]]
         if (profile !== null && typeof profile === 'object') return ids[index]
@@ -734,11 +993,14 @@ function createQuotaService(options) {
    * @param credentialRouteId - 解析凭据用的真实路由 id。
    */
   function readSource(sourceId, credentialRouteId) {
+    const source = sources[sourceId]
+    if (source === undefined) return Promise.resolve({ ok: false, reason: 'unsupported' })
+    if (source.enabled === false) return Promise.resolve({ ok: false, reason: 'disabled' })
     const cached = cache.get(sourceId)
-    if (cached !== undefined && now() - cached.at < CACHE_TTL_MS) return Promise.resolve(cached.entry)
+    if (cached !== undefined && now() - cached.at < cacheTtlMs) return Promise.resolve(cached.entry)
     const pending = inflight.get(sourceId)
     if (pending !== undefined) return pending
-    const task = fetchOne(credentialRouteId, QUOTA_SOURCES[sourceId])
+    const task = fetchOne(credentialRouteId, source)
       .catch((error) => ({ ok: false, reason: 'unexpected', message: messageOf(error) }))
       .then((entry) => {
         cache.set(sourceId, { at: now(), entry })
@@ -751,7 +1013,7 @@ function createQuotaService(options) {
 
   async function readOne(route) {
     const providers = providersSectionOf(settingsOf())
-    const hit = sourceOfRoute(route, providers)
+    const hit = sourceOfRoute(route, providers, sources)
     if (hit === null) return { ok: false, reason: 'unsupported' }
     return readSource(hit.sourceId, credentialRouteIdOf(providers, hit.sourceId))
   }
@@ -759,7 +1021,7 @@ function createQuotaService(options) {
   async function readAll() {
     const providers = providersSectionOf(settingsOf())
     const routes = {}
-    await Promise.all(Object.keys(QUOTA_SOURCES).map(async (sourceId) => {
+    await Promise.all(Object.keys(sources).map(async (sourceId) => {
       const entry = await readSource(sourceId, credentialRouteIdOf(providers, sourceId))
       // 同一份条目写给每个键：本机 id（如 opencodego）与规范名（opencode-go）都能命中。
       for (const id of emittedIdsOf(providers, sourceId)) routes[id] = entry
@@ -769,7 +1031,7 @@ function createQuotaService(options) {
 
   function invalidate(route) {
     if (route === undefined) { cache.clear(); return }
-    const hit = sourceOfRoute(route, providersSectionOf(settingsOf()))
+    const hit = sourceOfRoute(route, providersSectionOf(settingsOf()), sources)
     cache.delete(hit !== null ? hit.sourceId : route)
   }
 
@@ -797,17 +1059,25 @@ function isLocalRequest(req) {
   return addr === '::1' || addr === '::ffff:127.0.0.1' || addr.indexOf('127.') === 0
 }
 
-export function apply(ctx) {
+export function apply(ctx, rawConfig) {
+  const resolved = resolveConfig(rawConfig)
+  const sources = effectiveSourcesOf(resolved)
   const service = createQuotaService({
     credentialsOf: () => ctx.get('credentials'),
     settingsOf: () => ctx.get('settings'),
+    sources,
+    cacheTtlMs: resolved.cacheTtlMs,
+    timeoutMs: resolved.timeoutMs,
   })
+  for (const warning of resolved.warnings) {
+    ctx.logger?.warn?.('[dsh-plugin-provider-badge] config ' + warning.path + ': ' + warning.message)
+  }
 
   // 凭据被 pi-ai 刷新/替换后立刻丢弃缓存：否则过期判断会拿旧令牌继续算 60s。
   // 引用型数据源（apiKeyEnv）没有记录级事件，改动在缓存窗口内自然过期。
   if (typeof ctx.on === 'function') {
     ctx.on('credentials/record-updated', (key) => {
-      for (const [route, source] of Object.entries(QUOTA_SOURCES)) {
+      for (const [route, source] of Object.entries(sources)) {
         if (source.auth.kind === 'grant' && source.auth.recordKey === key) service.invalidate(route)
       }
     })
@@ -824,6 +1094,10 @@ export function apply(ctx) {
             return sendJson(res, 405, { ok: false, error: 'GET only' })
           }
           try {
+            // 总开关关闭：不读上游、不回条目，浏览器半据此不渲染任何额度。
+            if (resolved.enabled !== true) {
+              return sendJson(res, 200, { ok: true, updatedAt: Date.now(), routes: {}, disabled: true })
+            }
             return sendJson(res, 200, { ok: true, updatedAt: Date.now(), routes: await service.readAll() })
           } catch (error) {
             return sendJson(res, 200, { ok: true, updatedAt: Date.now(), routes: {}, error: messageOf(error) })
@@ -832,9 +1106,32 @@ export function apply(ctx) {
       }),
       'provider-badge: ' + QUOTA_PATH,
     )
+
+    // 可见配置：只读回显生效结果（无凭据值），改了配置不用再读 JS。
+    ctx.effect(
+      () => webCtx.webServer.register({
+        kind: 'exact',
+        path: CONFIG_PATH,
+        handler: async (req, res) => {
+          if (isLocalRequest(req) !== true) return sendJson(res, 403, { ok: false, error: 'local requests only' })
+          if (req !== null && typeof req === 'object' && req.method !== 'GET') {
+            return sendJson(res, 405, { ok: false, error: 'GET only' })
+          }
+          try {
+            return sendJson(res, 200, configViewOf(resolved, sources, providersSectionOf(ctx.get('settings'))))
+          } catch (error) {
+            return sendJson(res, 200, { ok: false, error: messageOf(error) })
+          }
+        },
+      }),
+      'provider-badge: ' + CONFIG_PATH,
+    )
   })
 
-  ctx.logger?.info?.('[dsh-plugin-provider-badge] host half mounted (client badge + ' + QUOTA_PATH + ')')
+  if (resolved.enabled !== true) {
+    ctx.logger?.warn?.('[dsh-plugin-provider-badge] config enabled=false: 额度端点仍挂载但一律返回 disabled')
+  }
+  ctx.logger?.info?.('[dsh-plugin-provider-badge] host half mounted (client badge + ' + QUOTA_PATH + ' + ' + CONFIG_PATH + ')')
 }
 
 /** probe 专用面：纯函数与额度服务工厂（不构成任何运行时承诺）。 */
@@ -843,6 +1140,16 @@ export const __test = {
   QUOTA_SOURCES,
   QUOTA_PATH,
   providersSectionOf,
+  CONFIG_PATH,
+  CONFIG_VERSION,
+  CONFIG_DEFAULTS,
+  CONFIG_LIMITS,
+  USAGE_HOST_ALLOWLIST,
+  originOfUrl,
+  isAllowedUsageUrl,
+  resolveConfig,
+  effectiveSourcesOf,
+  configViewOf,
   routeIdsFor,
   matchedRouteIds,
   sourceOfRoute,

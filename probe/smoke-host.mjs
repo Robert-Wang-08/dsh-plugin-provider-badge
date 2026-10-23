@@ -31,6 +31,8 @@ const {
   kimiWindowsFromUsages, kimiWindowsFromCounts, kimiWindowsFromWeeklyUsage, kimiEntryFromPayload,
   OPENCODE_WINDOW_SECONDS, opencodeEntryFromPayload,
   createQuotaService, isLocalRequest,
+  CONFIG_PATH, CONFIG_VERSION, CONFIG_DEFAULTS, USAGE_HOST_ALLOWLIST,
+  resolveConfig, effectiveSourcesOf, configViewOf,
   providersSectionOf, routeIdsFor, matchedRouteIds, sourceOfRoute,
 } = __test
 
@@ -439,7 +441,7 @@ function makeRes() {
     end(body) { this.body = body },
   }
 }
-function mountPlugin(credentials, settings) {
+function mountPlugin(credentials, settings, rawConfig) {
   const registered = []
   const events = []
   const ctx = {
@@ -453,7 +455,7 @@ function mountPlugin(credentials, settings) {
     inject: (deps, callback) => callback({ webServer: { register: (entry) => { registered.push(entry); return () => {} } } }),
     logger: { info: () => {} },
   }
-  apply(ctx)
+  apply(ctx, rawConfig)
   return { registered, events }
 }
 const previousFetch = globalThis.fetch
@@ -467,10 +469,12 @@ try {
   }
   const creds = makeCredentials(grantRecord())
   const { registered, events } = mountPlugin(creds.service, makeSettings({ 'kimi-coding': 'LLMKEY_KIMI', 'opencode-go': 'OPENCODE_API_KEY' }).service)
-  check('H7 注册了恰好一个端点', registered.length === 1 && registered[0].path === QUOTA_PATH && registered[0].kind === 'exact')
+  check('H7 注册了两个只读端点（额度 + 可见配置）', registered.length === 2
+    && registered[0].path === QUOTA_PATH && registered[0].kind === 'exact'
+    && registered[1].path === CONFIG_PATH && registered[1].kind === 'exact')
   check('H7 订阅了凭据记录变更事件', events.some((e) => e.eventName === 'credentials/record-updated'))
 
-  const handler = registered[0].handler
+  const handler = registered.find((entry) => entry.path === QUOTA_PATH).handler
   const forbidden = makeRes()
   await handler({ method: 'GET', socket: { remoteAddress: '10.0.0.7' } }, forbidden)
   check('H7 非回环请求 → 403', forbidden.status === 403)
@@ -945,6 +949,135 @@ await (async () => {
     && JSON.stringify(all['opencode-go']) === JSON.stringify(all.opencodego))
   check('H10 readAll 键数 = 3 + 命中数，且同一数据源只打一次上游', Object.keys(all).length === 4 && calls.length === 1)
 })()
+
+/* ── H11：可见配置（默认值 / 覆盖 / 白名单 / 回显） ─────────────────── */
+
+check('H11 缺省配置 = 代码常量（未装 pack 时行为不变）', (() => {
+  const resolved = resolveConfig(undefined)
+  return resolved.configVersion === CONFIG_VERSION && resolved.enabled === true
+    && resolved.cacheTtlMs === CONFIG_DEFAULTS.cacheTtlMs && resolved.timeoutMs === CONFIG_DEFAULTS.timeoutMs
+    && resolved.warnings.length === 0 && Object.keys(resolved.sources).length === 0
+    && Object.keys(resolved.ui.labels).length === 0
+})())
+
+check('H11 数值项越界收敛、非数字忽略并记 warning', (() => {
+  const low = resolveConfig({ cacheTtlMs: 1, timeoutMs: 1 })
+  const high = resolveConfig({ cacheTtlMs: 99999999, timeoutMs: 99999999 })
+  const bad = resolveConfig({ cacheTtlMs: 'soon' })
+  return low.cacheTtlMs === 5000 && low.timeoutMs === 1000
+    && high.cacheTtlMs === 600000 && high.timeoutMs === 30000
+    && bad.cacheTtlMs === CONFIG_DEFAULTS.cacheTtlMs && bad.warnings.length === 1 && bad.warnings[0].path === 'cacheTtlMs'
+})())
+
+check('H11 未知数据源被忽略并记 warning', (() => {
+  const resolved = resolveConfig({ sources: { 'no-such-source': { enabled: false } } })
+  return resolved.warnings.length === 1 && resolved.warnings[0].path === 'sources.no-such-source'
+    && Object.keys(resolved.sources).length === 0
+})())
+
+check('H11 usagePath 相对路径拼到默认端点 origin 上', (() => {
+  const sources = effectiveSourcesOf(resolveConfig({ sources: { 'opencode-go': { usagePath: '/zen/go/v2/usage' } } }))
+  return sources['opencode-go'].url === 'https://opencode.ai/zen/go/v2/usage'
+    && sources['kimi-coding'].url === 'https://api.kimi.com/coding/v1/usages'
+})())
+
+check('H11 usagePath 绝对 URL：白名单外一律拒绝（防凭据外发）', (() => {
+  const resolved = resolveConfig({ sources: { 'opencode-go': { usagePath: 'https://evil.example.com/usage' } } })
+  const sources = effectiveSourcesOf(resolved)
+  const plain = resolveConfig({ sources: { 'opencode-go': { usagePath: 'http://opencode.ai/zen/go/v1/usage' } } })
+  return resolved.warnings.length === 1 && resolved.warnings[0].path === 'sources.opencode-go.usagePath'
+    && sources['opencode-go'].url === 'https://opencode.ai/zen/go/v1/usage'
+    && plain.warnings.length === 1 && effectiveSourcesOf(plain)['opencode-go'].url === 'https://opencode.ai/zen/go/v1/usage'
+})())
+
+check('H11 usagePath 绝对 URL：白名单内允许（镜像/自建代理）', (() => {
+  const resolved = resolveConfig({ sources: { 'kimi-coding': { usagePath: 'https://api.kimi.com/coding/v1/usages' } } })
+  return resolved.warnings.length === 0
+    && effectiveSourcesOf(resolved)['kimi-coding'].url === 'https://api.kimi.com/coding/v1/usages'
+    && USAGE_HOST_ALLOWLIST.join(',') === 'opencode.ai,api.kimi.com,chatgpt.com'
+})())
+
+check('H11 baseHosts / aliases 覆盖后按新值判定真实路由', (() => {
+  const sources = effectiveSourcesOf(resolveConfig({
+    sources: { 'opencode-go': { baseHosts: ['mirror.example.com/go'], aliases: ['opencode-go', 'myopencode'] } },
+  }))
+  const providers = { myopencode: { baseURL: 'https://mirror.example.com/go/v1' } }
+  const ids = routeIdsFor(providers, sources['opencode-go'])
+  return ids.join(',') === 'opencode-go,myopencode'
+})())
+
+check('H11 ui 校验：坏色值/超长缩写被拒，合法项保留', (() => {
+  const resolved = resolveConfig({
+    ui: {
+      colors: { 'opencode-go': '#7CB342', opencodego: 'green', 'kimi-coding': '#12345' },
+      labels: { opencodego: 'opengo', 'kimi-coding': '123456789' },
+      aliases: { opencodego: 'opencode-go' },
+    },
+  })
+  return resolved.ui.colors['opencode-go'] === '#7CB342' && resolved.ui.colors.opencodego === undefined
+    && resolved.ui.colors['kimi-coding'] === undefined
+    && resolved.ui.labels.opencodego === 'opengo' && resolved.ui.labels['kimi-coding'] === undefined
+    && resolved.ui.aliases.opencodego === 'opencode-go'
+    && resolved.warnings.length === 3
+})())
+
+check('H11 回显只带引用名，不含任何凭据值', (() => {
+  const providers = { opencodego: { apiKeyEnv: 'OPENCODEGO_API_KEY', baseURL: 'https://opencode.ai/zen/go/v1' } }
+  const view = configViewOf(resolveConfig(undefined), effectiveSourcesOf(resolveConfig(undefined)), providers)
+  const text = JSON.stringify(view)
+  return view.ok === true && view.sources['opencode-go'].refNames.join(',') === 'OPENCODEGO_API_KEY,OPENCODE_API_KEY'
+    && view.sources['opencode-go'].routeIds.join(',') === 'opencode-go,opencodego'
+    && view.sources['openai-codex'].refNames.join(',') === 'llm-pi-ai/openai-codex'
+    && !text.includes('sk-') && !text.includes(OPENCODE_KEY) && view.ui !== undefined
+})())
+
+await (async () => {
+  const { stub, calls } = makeFetchStub(() => okResponse(CURRENT_OPENCODE_PAYLOAD))
+  const sources = effectiveSourcesOf(resolveConfig({ enabled: false }))
+  const service = createQuotaService({
+    credentialsOf: () => makeCredentials(undefined, { OPENCODE_API_KEY: OPENCODE_KEY }).service,
+    sources,
+    fetchImpl: stub,
+  })
+  const res = await service.readAll()
+  check('H11 总开关关闭 → 数据源 disabled 且零上游请求', calls.length === 0 && res['opencode-go'].reason === 'disabled')
+})()
+
+await (async () => {
+  const { stub, calls } = makeFetchStub(() => okResponse(CURRENT_OPENCODE_PAYLOAD))
+  const sources = effectiveSourcesOf(resolveConfig({ sources: { 'kimi-coding': { enabled: false } } }))
+  const creds = makeCredentials(undefined, { OPENCODE_API_KEY: OPENCODE_KEY })
+  const service = createQuotaService({ credentialsOf: () => creds.service, sources, fetchImpl: stub })
+  const res = await service.readAll()
+  check('H11 单源关闭：该源 disabled、其它源照常且只打自己一次', res['kimi-coding'].reason === 'disabled'
+    && res['opencode-go'].ok === true && calls.length === 1 && calls[0].url.includes('/zen/go/v1/usage'))
+})()
+
+await (async () => {
+  const fetched = []
+  globalThis.fetch = async (url) => { fetched.push(String(url)); return okResponse(CURRENT_OPENCODE_PAYLOAD) }
+  const creds = makeCredentials(undefined, { OPENCODEGO_API_KEY: OPENCODE_KEY })
+  const settings = makeSettings({ opencodego: { apiKeyEnv: 'OPENCODEGO_API_KEY', baseURL: 'https://opencode.ai/zen/go/v1' } })
+  const { registered } = mountPlugin(creds.service, settings.service, { ui: { labels: { opencodego: 'opengo' } } })
+  const configHandler = registered.find((entry) => entry.path === CONFIG_PATH).handler
+  const res = makeRes()
+  await configHandler({ method: 'GET', socket: { remoteAddress: '127.0.0.1' } }, res)
+  const body = JSON.parse(res.body)
+  check('H11 配置端点：回环 GET → 200，回显覆盖与本机真实 id', res.status === 200 && body.ok === true
+    && body.ui.labels.opencodego === 'opengo' && body.sources['opencode-go'].routeIds.includes('opencodego')
+    && body.configVersion === CONFIG_VERSION && fetched.length === 0)
+  check('H11 配置端点不含密钥，且同样只答回环', !res.body.includes(OPENCODE_KEY) && !res.body.includes('sk-')
+    && (await (async () => { const bad = makeRes(); await configHandler({ method: 'GET', socket: { remoteAddress: '10.0.0.7' } }, bad); return bad.status === 403 })()))
+  check('H11 配置端点拒绝非 GET', await (async () => { const bad = makeRes(); await configHandler({ method: 'POST', socket: { remoteAddress: '127.0.0.1' } }, bad); return bad.status === 405 })())
+})()
+
+check('H11 坏配置不崩（sources/ui 类型错都降级）', (() => {
+  for (const bad of [{ sources: [] }, { sources: 'x' }, { ui: null }, { ui: { labels: [] } }, { sources: { 'opencode-go': 'x' } }, { enabled: 'yes' }]) {
+    const resolved = resolveConfig(bad)
+    if (resolved.enabled !== true) return false
+  }
+  return true
+})())
 
 /* ── 汇总 ─────────────────────────────────────────────────────────── */
 
